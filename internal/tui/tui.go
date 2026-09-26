@@ -62,6 +62,7 @@ type col struct {
 
 type row struct {
 	cells       []string
+	key         string // stable identity for keeping the selection across refreshes; defaults to ip
 	ip          string
 	banned      bool
 	whitelisted bool
@@ -85,6 +86,7 @@ type model struct {
 	w, h    int
 	tab     tab
 	cursor  [tabCount]int
+	sel     [tabCount]string // key of the selected row; the cursor follows it when rows reorder
 	offset  [tabCount]int
 	sortBy  int // attackers: 0 failures, 1 last seen, 2 bans
 	filter  string
@@ -189,7 +191,7 @@ func (m *model) key(k tea.KeyMsg) tea.Cmd {
 		case tea.KeyRunes, tea.KeySpace:
 			m.filter += string(k.Runes)
 		}
-		m.cursor[m.tab], m.offset[m.tab] = 0, 0
+		m.cursor[m.tab], m.offset[m.tab], m.sel[m.tab] = 0, 0, ""
 		return nil
 	}
 	rows := m.rows()
@@ -211,9 +213,9 @@ func (m *model) key(k tea.KeyMsg) tea.Cmd {
 	case "pgdown":
 		m.move(m.pageSize(), len(rows))
 	case "home", "g":
-		m.cursor[m.tab] = 0
+		m.setCursor(0, len(rows))
 	case "end", "G":
-		m.cursor[m.tab] = max(len(rows)-1, 0)
+		m.setCursor(len(rows)-1, len(rows))
 	case "/":
 		m.editing = true
 	case "esc":
@@ -277,9 +279,20 @@ func (m *model) call(req api.Request) tea.Cmd {
 }
 
 func (m *model) move(d, n int) {
-	c := m.cursor[m.tab] + d
-	c = min(c, n-1)
-	m.cursor[m.tab] = max(c, 0)
+	m.setCursor(m.cursor[m.tab]+d, n)
+}
+
+// setCursor moves the cursor and forgets the pinned row so View re-pins the new one.
+func (m *model) setCursor(c, n int) {
+	m.cursor[m.tab] = max(min(c, n-1), 0)
+	m.sel[m.tab] = ""
+}
+
+func (r row) id() string {
+	if r.key != "" {
+		return r.key
+	}
+	return r.ip
 }
 
 // ---- data
@@ -309,7 +322,12 @@ func (m *model) rows() []row {
 	switch m.tab {
 	case tabBanned:
 		recs := filterRecs(s.Records, func(r *guard.IPRecord) bool { return r.Banned(now) })
-		sort.Slice(recs, func(i, j int) bool { return recs[i].BannedAt.After(recs[j].BannedAt) })
+		sort.Slice(recs, func(i, j int) bool {
+			if !recs[i].BannedAt.Equal(recs[j].BannedAt) {
+				return recs[i].BannedAt.After(recs[j].BannedAt)
+			}
+			return recs[i].IP < recs[j].IP
+		})
 		for _, r := range recs {
 			reason := r.LastReason
 			if r.Manual {
@@ -323,15 +341,21 @@ func (m *model) rows() []row {
 		recs := filterRecs(s.Records, func(r *guard.IPRecord) bool { return r.Failures > 0 || r.Successes > 0 })
 		sort.Slice(recs, func(i, j int) bool {
 			a, b := recs[i], recs[j]
+			// Every ordering ends in a unique key so rows never swap between refreshes.
 			switch m.sortBy {
 			case 1:
-				return a.LastSeen.After(b.LastSeen)
+				if !a.LastSeen.Equal(b.LastSeen) {
+					return a.LastSeen.After(b.LastSeen)
+				}
 			case 2:
 				if a.BanCount != b.BanCount {
 					return a.BanCount > b.BanCount
 				}
 			}
-			return a.Failures > b.Failures
+			if a.Failures != b.Failures {
+				return a.Failures > b.Failures
+			}
+			return a.IP < b.IP
 		})
 		for _, r := range recs {
 			st, style := "监视中", lipgloss.NewStyle()
@@ -371,7 +395,7 @@ func (m *model) rows() []row {
 			default:
 				ty = e.Type
 			}
-			out = append(out, row{ip: e.IP, banned: bannedSet[e.IP], whitelisted: whiteSet[e.IP], style: style, cells: []string{
+			out = append(out, row{key: e.Time.Format(time.RFC3339Nano) + e.Type + e.IP, ip: e.IP, banned: bannedSet[e.IP], whitelisted: whiteSet[e.IP], style: style, cells: []string{
 				e.Time.Local().Format("2006-01-02 15:04:05"), ty, e.IP, e.User, e.Reason}})
 		}
 	case tabUsers:
@@ -398,7 +422,7 @@ func (m *model) rows() []row {
 		for i, e := range list {
 			pct := float64(e.v) * 100 / float64(max(total, 1))
 			bar := strings.Repeat("█", int(float64(e.v)*30/float64(top)))
-			out = append(out, row{cells: []string{fmt.Sprint(i + 1), e.k, num(e.v), fmt.Sprintf("%.1f%%", pct), sMuted.Render(bar)}})
+			out = append(out, row{key: e.k, cells: []string{fmt.Sprint(i + 1), e.k, num(e.v), fmt.Sprintf("%.1f%%", pct), sMuted.Render(bar)}})
 		}
 	case tabWhitelist:
 		for _, e := range s.Whitelist {
@@ -450,7 +474,12 @@ func topUsers(u map[string]int64, n int) string {
 	for k, v := range u {
 		l = append(l, kv{k, v})
 	}
-	sort.Slice(l, func(i, j int) bool { return l[i].v > l[j].v })
+	sort.Slice(l, func(i, j int) bool {
+		if l[i].v != l[j].v {
+			return l[i].v > l[j].v
+		}
+		return l[i].k < l[j].k
+	})
 	var parts []string
 	for i := 0; i < len(l) && i < n; i++ {
 		parts = append(parts, fmt.Sprintf("%s(%d)", l[i].k, l[i].v))
@@ -545,8 +574,19 @@ func (m *model) View() string {
 	b.WriteString(sHead.Render(fmtRow(headers(cols), cols, widths)) + "\n")
 
 	page := m.pageSize()
+	if want := m.sel[m.tab]; want != "" {
+		for i, r := range rows {
+			if r.id() == want {
+				m.cursor[m.tab] = i
+				break
+			}
+		}
+	}
 	cur := min(m.cursor[m.tab], max(len(rows)-1, 0))
 	m.cursor[m.tab] = cur
+	if len(rows) > 0 {
+		m.sel[m.tab] = rows[cur].id()
+	}
 	off := m.offset[m.tab]
 	if cur < off {
 		off = cur
@@ -561,7 +601,8 @@ func (m *model) View() string {
 	for i := off; i < len(rows) && i < off+page; i++ {
 		line := fmtRow(rows[i].cells, cols, widths)
 		if i == cur {
-			line = sSel.Width(m.w).Render(rows[i].style.Render(line))
+			// One style pass: nesting renders would reset the background mid-line.
+			line = rows[i].style.Background(cSelBg).Width(m.w - 1).Render(line)
 		} else {
 			line = rows[i].style.Render(line)
 		}

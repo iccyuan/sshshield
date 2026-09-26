@@ -535,7 +535,10 @@ func (g *Guard) Snapshot() *Snapshot {
 		if bi != bj {
 			return bi
 		}
-		return s.Records[i].Failures > s.Records[j].Failures
+		if s.Records[i].Failures != s.Records[j].Failures {
+			return s.Records[i].Failures > s.Records[j].Failures
+		}
+		return s.Records[i].IP < s.Records[j].IP // map order is random; keep output stable
 	})
 	if len(s.Records) > maxSnapshotRecords {
 		s.Records = s.Records[:maxSnapshotRecords]
