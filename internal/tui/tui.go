@@ -3,15 +3,18 @@ package tui
 
 import (
 	"fmt"
+	"image/color"
+	"io"
 	"net"
 	"os"
 	"sort"
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/x/ansi"
+	"golang.org/x/term"
 
 	"github.com/iccyuan/sshshield/internal/api"
 	"github.com/iccyuan/sshshield/internal/config"
@@ -21,26 +24,34 @@ import (
 const refreshEvery = time.Second
 
 var (
-	cAccent = lipgloss.AdaptiveColor{Light: "#0969da", Dark: "#58a6ff"}
-	cRed    = lipgloss.AdaptiveColor{Light: "#cf222e", Dark: "#ff7b72"}
-	cGreen  = lipgloss.AdaptiveColor{Light: "#1a7f37", Dark: "#3fb950"}
-	cYellow = lipgloss.AdaptiveColor{Light: "#9a6700", Dark: "#d29922"}
-	cMuted  = lipgloss.AdaptiveColor{Light: "#6e7781", Dark: "#8b949e"}
-	cBorder = lipgloss.AdaptiveColor{Light: "#d0d7de", Dark: "#30363d"}
-	cSelBg  = lipgloss.AdaptiveColor{Light: "#ddf4ff", Dark: "#1f2d3d"}
-
-	sTitle  = lipgloss.NewStyle().Bold(true).Foreground(cAccent)
-	sMuted  = lipgloss.NewStyle().Foreground(cMuted)
-	sRed    = lipgloss.NewStyle().Foreground(cRed)
-	sGreen  = lipgloss.NewStyle().Foreground(cGreen)
-	sYellow = lipgloss.NewStyle().Foreground(cYellow)
-	sBold   = lipgloss.NewStyle().Bold(true)
-	sCard   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(cBorder).Padding(0, 1)
-	sTabOn  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#ffffff")).Background(cAccent).Padding(0, 1)
-	sTabOff = lipgloss.NewStyle().Foreground(cMuted).Padding(0, 1)
-	sHead   = lipgloss.NewStyle().Bold(true).Foreground(cMuted)
-	sSel    = lipgloss.NewStyle().Background(cSelBg)
+	cAccent, cRed, cGreen, cYellow, cMuted, cBorder, cSelBg                     color.Color
+	sTitle, sMuted, sRed, sGreen, sYellow, sBold, sCard, sTabOn, sTabOff, sHead lipgloss.Style
 )
+
+func init() { setTheme(true) }
+
+// setTheme builds the palette for a dark or light terminal background.
+func setTheme(dark bool) {
+	ld := lipgloss.LightDark(dark)
+	cAccent = ld(lipgloss.Color("#0969da"), lipgloss.Color("#58a6ff"))
+	cRed = ld(lipgloss.Color("#cf222e"), lipgloss.Color("#ff7b72"))
+	cGreen = ld(lipgloss.Color("#1a7f37"), lipgloss.Color("#3fb950"))
+	cYellow = ld(lipgloss.Color("#9a6700"), lipgloss.Color("#d29922"))
+	cMuted = ld(lipgloss.Color("#6e7781"), lipgloss.Color("#8b949e"))
+	cBorder = ld(lipgloss.Color("#d0d7de"), lipgloss.Color("#30363d"))
+	cSelBg = ld(lipgloss.Color("#ddf4ff"), lipgloss.Color("#1f2d3d"))
+
+	sTitle = lipgloss.NewStyle().Bold(true).Foreground(cAccent)
+	sMuted = lipgloss.NewStyle().Foreground(cMuted)
+	sRed = lipgloss.NewStyle().Foreground(cRed)
+	sGreen = lipgloss.NewStyle().Foreground(cGreen)
+	sYellow = lipgloss.NewStyle().Foreground(cYellow)
+	sBold = lipgloss.NewStyle().Bold(true)
+	sCard = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(cBorder).Padding(0, 1)
+	sTabOn = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#ffffff")).Background(cAccent).Padding(0, 1)
+	sTabOff = lipgloss.NewStyle().Foreground(cMuted).Padding(0, 1)
+	sHead = lipgloss.NewStyle().Bold(true).Foreground(cMuted)
+}
 
 type tab int
 
@@ -77,8 +88,15 @@ type (
 		text string
 		err  error
 	}
-	tickMsg struct{}
+	quitMsg struct{}
 )
+
+type (
+	msg any
+	cmd func() msg // runs off the UI goroutine; its result is fed back to update
+)
+
+func quit() msg { return quitMsg{} }
 
 type model struct {
 	sock    string
@@ -105,30 +123,84 @@ type pending struct {
 }
 
 func Run(sock string) error {
-	m := &model{sock: sock}
-	_, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithOutput(syncOutput{os.Stdout})).Run()
-	return err
-}
-
-// syncOutput brackets every write in DEC mode 2026 (synchronized update), so
-// terminals that support it paint each frame atomically instead of showing a
-// half-redrawn line; others ignore the sequence. Embedding *os.File keeps the
-// Fd/Read/Close methods bubbletea needs to detect the terminal.
-type syncOutput struct{ *os.File }
-
-func (s syncOutput) Write(p []byte) (int, error) {
-	buf := make([]byte, 0, len(p)+16)
-	buf = append(buf, "\x1b[?2026h"...)
-	buf = append(buf, p...)
-	buf = append(buf, "\x1b[?2026l"...)
-	if _, err := s.File.Write(buf); err != nil {
-		return 0, err
+	in, out := os.Stdin, os.Stdout
+	if !term.IsTerminal(int(in.Fd())) || !term.IsTerminal(int(out.Fd())) {
+		return fmt.Errorf("TUI 需要在终端中运行，非交互环境请用 sshshield status")
 	}
-	return len(p), nil
+	w, h, err := term.GetSize(int(out.Fd()))
+	if err != nil {
+		return err
+	}
+	state, err := term.MakeRaw(int(in.Fd()))
+	if err != nil {
+		return err
+	}
+	cw := colorprofile.NewWriter(out, os.Environ()) // downgrade colors to what the terminal supports
+	// Alt screen, hidden cursor, no auto-wrap (so writing the last column never scrolls),
+	// then ask for the background color (OSC 11) to pick the light or dark palette.
+	_, _ = io.WriteString(out, "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b]11;?\x1b\\")
+	defer func() {
+		_, _ = io.WriteString(out, "\x1b[m\x1b[?7h\x1b[?25h\x1b[?1049l")
+		_ = term.Restore(int(in.Fd()), state)
+	}()
+
+	m := &model{sock: sock, w: w, h: h}
+	scr := &screen{out: cw}
+	scr.resize(w, h)
+
+	msgs := make(chan msg, 64)
+	run := func(c cmd) {
+		if c != nil {
+			go func() { msgs <- c() }()
+		}
+	}
+	go func() {
+		buf := make([]byte, 1024)
+		var pending []byte
+		for {
+			n, err := in.Read(buf)
+			if err != nil {
+				msgs <- quitMsg{}
+				return
+			}
+			var evs []any
+			evs, pending = decodeInput(append(pending, buf[:n]...))
+			for _, ev := range evs {
+				msgs <- ev
+			}
+		}
+	}()
+
+	run(m.fetch())
+	ticker := time.NewTicker(refreshEvery)
+	defer ticker.Stop()
+	for {
+		if err := scr.render(m.render()); err != nil {
+			return err
+		}
+		select {
+		case <-ticker.C:
+			if w, h, err := term.GetSize(int(out.Fd())); err == nil && (w != m.w || h != m.h) {
+				m.w, m.h = w, h
+				scr.resize(w, h)
+			}
+			run(m.fetch())
+		case v := <-msgs:
+			if _, ok := v.(quitMsg); ok {
+				return nil
+			}
+			if bg, ok := v.(bgMsg); ok {
+				setTheme(bg.dark)
+				scr.prev = nil // colors changed everywhere: repaint
+				continue
+			}
+			run(m.update(v))
+		}
+	}
 }
 
-func (m *model) fetch() tea.Cmd {
-	return func() tea.Msg {
+func (m *model) fetch() cmd {
+	return func() msg {
 		resp, err := api.Call(m.sock, api.Request{Cmd: "snapshot"})
 		if err != nil {
 			return errMsg{err}
@@ -137,91 +209,88 @@ func (m *model) fetch() tea.Cmd {
 	}
 }
 
-func tick() tea.Cmd {
-	return tea.Tick(refreshEvery, func(time.Time) tea.Msg { return tickMsg{} })
-}
-
-func (m *model) Init() tea.Cmd { return tea.Batch(m.fetch(), tick()) }
-
 func (m *model) setStatus(s string) { m.status, m.statusT = s, time.Now() }
 
-func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.w, m.h = msg.Width, msg.Height
+// update applies a message; the returned cmd runs asynchronously and its
+// result comes back as another message.
+func (m *model) update(v msg) cmd {
+	switch v := v.(type) {
 	case snapMsg:
-		m.snap, m.err = msg.s, nil
+		m.snap, m.err = v.s, nil
 	case errMsg:
-		m.err = msg.err
-	case tickMsg:
-		return m, tea.Batch(m.fetch(), tick())
+		m.err = v.err
 	case actionMsg:
-		if msg.err != nil {
-			m.setStatus(sRed.Render("✗ " + msg.err.Error()))
+		if v.err != nil {
+			m.setStatus(sRed.Render("✗ " + v.err.Error()))
 		} else {
-			m.setStatus(sGreen.Render("✓ " + msg.text))
+			m.setStatus(sGreen.Render("✓ " + v.text))
 		}
-		return m, m.fetch()
-	case tea.KeyMsg:
-		return m, m.key(msg)
+		return m.fetch()
+	case key:
+		return m.onKey(v)
 	}
-	return m, nil
+	return nil
 }
 
-func (m *model) key(k tea.KeyMsg) tea.Cmd {
+// editText applies a key press to a single-line text buffer.
+func editText(buf string, k key) string {
+	switch {
+	case k.name == "backspace":
+		if r := []rune(buf); len(r) > 0 {
+			return string(r[:len(r)-1])
+		}
+	case k.text != "":
+		return buf + k.text
+	}
+	return buf
+}
+
+func (m *model) onKey(k key) cmd {
 	if m.confirm != nil {
 		p := m.confirm
 		m.confirm = nil
-		if k.String() == "y" || k.String() == "Y" || k.String() == "enter" {
+		if k.name == "y" || k.name == "Y" || k.name == "enter" {
 			return m.call(p.req)
 		}
 		m.setStatus(sMuted.Render("已取消"))
 		return nil
 	}
 	if m.adding {
-		switch k.Type {
-		case tea.KeyEnter:
+		switch k.name {
+		case "enter":
 			m.adding = false
 			if v := strings.TrimSpace(m.addBuf); v != "" {
 				return m.call(api.Request{Cmd: "allow", IP: v})
 			}
-		case tea.KeyEsc:
+		case "esc":
 			m.adding = false
-		case tea.KeyBackspace:
-			if r := []rune(m.addBuf); len(r) > 0 {
-				m.addBuf = string(r[:len(r)-1])
-			}
-		case tea.KeyRunes:
-			m.addBuf += string(k.Runes)
+		default:
+			m.addBuf = editText(m.addBuf, k)
 		}
 		return nil
 	}
 	if m.editing {
-		switch k.Type {
-		case tea.KeyEnter:
+		switch k.name {
+		case "enter":
 			m.editing = false
-		case tea.KeyEsc:
+		case "esc":
 			m.editing, m.filter = false, ""
-		case tea.KeyBackspace:
-			if r := []rune(m.filter); len(r) > 0 {
-				m.filter = string(r[:len(r)-1])
-			}
-		case tea.KeyRunes, tea.KeySpace:
-			m.filter += string(k.Runes)
+		default:
+			m.filter = editText(m.filter, k)
 		}
 		m.cursor[m.tab], m.offset[m.tab], m.sel[m.tab] = 0, 0, ""
 		return nil
 	}
 	rows := m.rows()
-	switch k.String() {
+	switch k.name {
 	case "q", "ctrl+c":
-		return tea.Quit
+		return quit
 	case "tab", "right", "l":
 		m.tab = (m.tab + 1) % tabCount
 	case "shift+tab", "left", "h":
 		m.tab = (m.tab + tabCount - 1) % tabCount
 	case "1", "2", "3", "4", "5":
-		m.tab = tab(k.String()[0] - '1')
+		m.tab = tab(k.name[0] - '1')
 	case "up", "k":
 		m.move(-1, len(rows))
 	case "down", "j":
@@ -255,15 +324,15 @@ func (m *model) key(k tea.KeyMsg) tea.Cmd {
 		}
 		r := rows[m.cursor[m.tab]]
 		if m.tab == tabWhitelist {
-			if k.String() == "d" {
+			if k.name == "d" {
 				m.confirm = &pending{fmt.Sprintf("从白名单移除 %s ? (y/N)", r.ip), api.Request{Cmd: "disallow", IP: r.ip}}
 			}
 			return nil
 		}
-		if k.String() == "d" {
+		if k.name == "d" {
 			return nil
 		}
-		if k.String() == "w" {
+		if k.name == "w" {
 			if r.whitelisted {
 				m.setStatus(sMuted.Render(r.ip + " 已在白名单中"))
 				return nil
@@ -271,7 +340,7 @@ func (m *model) key(k tea.KeyMsg) tea.Cmd {
 			m.confirm = &pending{fmt.Sprintf("把 %s 加入白名单（永不封禁）? (y/N)", r.ip), api.Request{Cmd: "allow", IP: r.ip}}
 			return nil
 		}
-		if k.String() == "u" {
+		if k.name == "u" {
 			if !r.banned {
 				m.setStatus(sMuted.Render(r.ip + " 当前未被封禁"))
 				return nil
@@ -284,9 +353,9 @@ func (m *model) key(k tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-func (m *model) call(req api.Request) tea.Cmd {
+func (m *model) call(req api.Request) cmd {
 	sock := m.sock
-	return func() tea.Msg {
+	return func() msg {
 		resp, err := api.Call(sock, req)
 		text := req.Cmd + " " + req.IP + " 完成"
 		if err == nil && resp.Message != "" {
@@ -520,7 +589,7 @@ func (m *model) pageSize() int {
 	return max(m.h-6-4*m.cardRows(), 3)
 }
 
-func (m *model) View() string {
+func (m *model) render() string {
 	if m.w == 0 {
 		return "加载中…"
 	}
@@ -556,7 +625,7 @@ func (m *model) View() string {
 		{"成功登录", num(s.Stats.TotalSuccesses), sGreen},
 	}
 	perRow := (len(cards) + m.cardRows() - 1) / m.cardRows()
-	cw := max(m.w/perRow-2, 10)
+	cw := max(m.w/perRow, 12) // lipgloss v2 widths include the border
 	for start := 0; start < len(cards); start += perRow {
 		var rendered []string
 		for _, c := range cards[start:min(start+perRow, len(cards))] {

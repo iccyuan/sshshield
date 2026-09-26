@@ -1,0 +1,83 @@
+package tui
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+)
+
+func frameOut(t *testing.T, s *screen, frame string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	s.out = &buf
+	if err := s.render(frame); err != nil {
+		t.Fatal(err)
+	}
+	return buf.String()
+}
+
+func TestScreenWritesOnlyChangedCells(t *testing.T) {
+	s := &screen{}
+	s.resize(60, 3)
+	row := func(left string) string {
+		return "\x1b[31m 103.137.184.170  已封禁 \x1b[m 剩余 " + left + " 监视中"
+	}
+	frameOut(t, s, "标题\n"+row("3h31m49s")+"\n底栏")
+	out := frameOut(t, s, "标题\n"+row("3h31m48s")+"\n底栏")
+
+	if strings.Contains(out, "103.137") || strings.Contains(out, "标题") || strings.Contains(out, "底栏") {
+		t.Fatalf("unchanged text was rewritten: %q", out)
+	}
+	if !strings.Contains(out, "8") || strings.Contains(out, "\x1b[K") || strings.Contains(out, "\x1b[2J") {
+		t.Fatalf("expected only the changed digit and no erase: %q", out)
+	}
+	if again := frameOut(t, s, "标题\n"+row("3h31m48s")+"\n底栏"); again != "" {
+		t.Fatalf("identical frame produced output: %q", again)
+	}
+}
+
+func TestScreenWideCharBoundaries(t *testing.T) {
+	s := &screen{}
+	s.resize(20, 1)
+	frameOut(t, s, "ab监视中cd")
+	// 视 -> 封 changes one wide character: the whole character must be rewritten
+	// starting at its head column (col 5, 1-based), never half of it.
+	out := frameOut(t, s, "ab监封中cd")
+	if !strings.Contains(out, "\x1b[1;5H") || !strings.Contains(out, "封") || strings.Contains(out, "监") || strings.Contains(out, "中") {
+		t.Fatalf("wide span wrong: %q", out)
+	}
+	// Narrow text replacing a wide character must cover both of its columns.
+	out = frameOut(t, s, "ab监xy中cd")
+	if !strings.Contains(out, "\x1b[1;5H\x1b[mxy") {
+		t.Fatalf("narrow-over-wide span wrong: %q", out)
+	}
+	// And a wide character replacing narrow text starts at its own head.
+	out = frameOut(t, s, "ab监封中cd")
+	if !strings.Contains(out, "\x1b[1;5H") || !strings.Contains(out, "封") {
+		t.Fatalf("wide-over-narrow span wrong: %q", out)
+	}
+}
+
+func TestDecodeInput(t *testing.T) {
+	evs, rest := decodeInput([]byte("q\x1b[A\x1b[Z\x1b[6~\r\x7f中\x1b]11;rgb:ffff/ffff/ffff\x1b\\\x1b"))
+	var names []string
+	for _, e := range evs {
+		switch v := e.(type) {
+		case key:
+			names = append(names, v.name)
+		case bgMsg:
+			if v.dark {
+				t.Fatal("white background reported as dark")
+			}
+			names = append(names, "bg")
+		}
+	}
+	want := "q up shift+tab pgdown enter backspace 中 bg esc"
+	if got := strings.Join(names, " "); got != want || rest != nil {
+		t.Fatalf("got %q rest %q, want %q", got, rest, want)
+	}
+	// An incomplete CSI sequence is kept for the next read.
+	if evs, rest := decodeInput([]byte("\x1b[")); len(evs) != 0 || string(rest) != "\x1b[" {
+		t.Fatalf("partial sequence: %v %q", evs, rest)
+	}
+}
