@@ -65,27 +65,49 @@ func cellAt(l uv.Line, x int) *uv.Cell {
 	return &l[x]
 }
 
-// writeSpan emits the smallest run of whole characters covering every column
-// where old and cur differ. A nil old line means everything differs.
+// mergeGap is the longest run of unchanged cells kept inside one write; a
+// longer run is skipped with a cursor move instead (about 8 bytes).
+const mergeGap = 6
+
+// writeSpan emits the changed cells of a line as one or more runs of whole
+// characters, skipping unchanged stretches longer than mergeGap. A single run
+// from the first to the last change would rewrite everything in between, e.g.
+// an IP sitting between two ticking counters. A nil old line means everything
+// differs.
 func writeSpan(b *strings.Builder, old, cur uv.Line, y int) {
 	w := len(cur)
 	differs := func(x int) bool {
 		o := cellAt(old, x)
 		return o == nil || !o.Equal(cellAt(cur, x))
 	}
-	x0, x1 := -1, -1
+	var spans [][2]int
 	for x := 0; x < w; x++ {
-		if differs(x) {
-			if x0 < 0 {
-				x0 = x
-			}
-			x1 = x
+		if !differs(x) {
+			continue
+		}
+		if n := len(spans); n > 0 && x-spans[n-1][1]-1 <= mergeGap {
+			spans[n-1][1] = x
+		} else {
+			spans = append(spans, [2]int{x, x})
 		}
 	}
-	if x0 < 0 {
-		return
+	// Widen each run to whole characters, then merge runs that now touch.
+	var merged [][2]int
+	for _, sp := range spans {
+		x0, x1 := widen(old, cur, sp[0], sp[1], w)
+		if n := len(merged); n > 0 && x0 <= merged[n-1][1]+1 {
+			merged[n-1][1] = max(merged[n-1][1], x1)
+			continue
+		}
+		merged = append(merged, [2]int{x0, x1})
 	}
-	// Grow the span until neither frame has a wide character crossing its edges.
+	for _, sp := range merged {
+		emit(b, cur, sp[0], sp[1], y)
+	}
+}
+
+// widen grows [x0, x1] until neither frame has a wide character crossing its edges.
+func widen(old, cur uv.Line, x0, x1, w int) (int, int) {
 	for changed := true; changed; {
 		changed = false
 		for _, l := range []uv.Line{old, cur} {
@@ -113,7 +135,11 @@ func writeSpan(b *strings.Builder, old, cur uv.Line, y int) {
 			}
 		}
 	}
+	return x0, x1
+}
 
+// emit writes cells x0..x1 of line y from cur.
+func emit(b *strings.Builder, cur uv.Line, x0, x1, y int) {
 	fmt.Fprintf(b, "\x1b[%d;%dH\x1b[m", y+1, x0+1)
 	var pen uv.Style
 	for x := x0; x <= x1; x++ {

@@ -81,3 +81,19 @@ func TestDecodeInput(t *testing.T) {
 		t.Fatalf("partial sequence: %v %q", evs, rest)
 	}
 }
+
+func TestScreenSkipsUnchangedMiddle(t *testing.T) {
+	s := &screen{}
+	s.resize(80, 1)
+	// An IP between two ticking values: a single first-to-last span would
+	// rewrite it, which makes Termius flash its IP highlight.
+	line := func(a, b string) string { return "失败 " + a + "  来源 203.0.113.170 已封禁  剩余 " + b }
+	frameOut(t, s, line("12", "59s"))
+	out := frameOut(t, s, line("13", "58s"))
+	if strings.Contains(out, "203.0.113") {
+		t.Fatalf("IP between two changes was rewritten: %q", out)
+	}
+	if !strings.Contains(out, "3") || !strings.Contains(out, "8") {
+		t.Fatalf("changed digits missing: %q", out)
+	}
+}
