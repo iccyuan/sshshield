@@ -4,6 +4,7 @@ package tui
 import (
 	"fmt"
 	"net"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -17,7 +18,7 @@ import (
 	"github.com/iccyuan/sshshield/internal/guard"
 )
 
-const refreshEvery = 2 * time.Second
+const refreshEvery = time.Second
 
 var (
 	cAccent = lipgloss.AdaptiveColor{Light: "#0969da", Dark: "#58a6ff"}
@@ -105,8 +106,25 @@ type pending struct {
 
 func Run(sock string) error {
 	m := &model{sock: sock}
-	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
+	_, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithOutput(syncOutput{os.Stdout})).Run()
 	return err
+}
+
+// syncOutput brackets every write in DEC mode 2026 (synchronized update), so
+// terminals that support it paint each frame atomically instead of showing a
+// half-redrawn line; others ignore the sequence. Embedding *os.File keeps the
+// Fd/Read/Close methods bubbletea needs to detect the terminal.
+type syncOutput struct{ *os.File }
+
+func (s syncOutput) Write(p []byte) (int, error) {
+	buf := make([]byte, 0, len(p)+16)
+	buf = append(buf, "\x1b[?2026h"...)
+	buf = append(buf, p...)
+	buf = append(buf, "\x1b[?2026l"...)
+	if _, err := s.File.Write(buf); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 func (m *model) fetch() tea.Cmd {
@@ -334,7 +352,7 @@ func (m *model) rows() []row {
 				reason = "手动封禁"
 			}
 			out = append(out, row{ip: r.IP, banned: true, cells: []string{
-				r.IP, num(r.Failures), fmt.Sprint(r.BanCount), dur(r.BannedUntil.Sub(now)),
+				r.IP, num(r.Failures), fmt.Sprint(r.BanCount), countdown(r.BannedUntil.Sub(now)),
 				r.BannedUntil.Local().Format("01-02 15:04:05"), r.LastUser, reason}})
 		}
 	case tabAttackers:
@@ -793,9 +811,37 @@ func dur(d time.Duration) string {
 	return fmt.Sprintf("%ds", sec)
 }
 
-func ago(d time.Duration) string {
-	if d < 5*time.Second {
-		return "刚刚"
+// countdown always shows seconds so a ban's remaining time visibly ticks.
+func countdown(d time.Duration) string {
+	if d < 0 {
+		d = 0
 	}
-	return dur(d) + "前"
+	d = d.Round(time.Second)
+	day := d / (24 * time.Hour)
+	h := d % (24 * time.Hour) / time.Hour
+	mi := d % time.Hour / time.Minute
+	sec := d % time.Minute / time.Second
+	switch {
+	case day > 0:
+		return fmt.Sprintf("%dd%02dh%02dm%02ds", day, h, mi, sec)
+	case h > 0:
+		return fmt.Sprintf("%dh%02dm%02ds", h, mi, sec)
+	case mi > 0:
+		return fmt.Sprintf("%dm%02ds", mi, sec)
+	}
+	return fmt.Sprintf("%ds", sec)
+}
+
+// ago is deliberately coarse (minute granularity): a per-second value would
+// change every row on every refresh and force the whole table to be redrawn.
+func ago(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return "刚刚"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm前", d/time.Minute)
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh%dm前", d/time.Hour, d%time.Hour/time.Minute)
+	}
+	return fmt.Sprintf("%dd前", d/(24*time.Hour))
 }
