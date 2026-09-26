@@ -38,6 +38,7 @@ type IPRecord struct {
 	BannedAt    time.Time        `json:"banned_at,omitzero"`
 	BannedUntil time.Time        `json:"banned_until,omitzero"`
 	Manual      bool             `json:"manual,omitempty"`
+	Whitelisted bool             `json:"whitelisted,omitempty"` // computed per snapshot from ignore_ip
 	LastUser    string           `json:"last_user,omitempty"`
 	LastReason  string           `json:"last_reason,omitempty"`
 	Users       map[string]int64 `json:"users,omitempty"`
@@ -77,6 +78,7 @@ type Guard struct {
 	cfg     *config.Config
 	fw      firewall.Backend
 	source  string
+	cfgPath string // where whitelist edits are saved; empty = in-memory only
 	started time.Time
 
 	mu      sync.Mutex
@@ -86,8 +88,8 @@ type Guard struct {
 	evLogSz int64
 }
 
-func New(cfg *config.Config, fw firewall.Backend, source string) (*Guard, error) {
-	g := &Guard{cfg: cfg, fw: fw, source: source, started: time.Now()}
+func New(cfg *config.Config, cfgPath string, fw firewall.Backend, source string) (*Guard, error) {
+	g := &Guard{cfg: cfg, cfgPath: cfgPath, fw: fw, source: source, started: time.Now()}
 	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -217,12 +219,11 @@ func (g *Guard) record(ip string, now time.Time) *IPRecord {
 // Handle processes one parsed log event.
 func (g *Guard) Handle(ev parser.Event) {
 	now := time.Now()
-	if g.cfg.Ignored(ev.IP) {
-		return
-	}
 	ip := ev.IP.String()
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	// Whitelisted IPs are still counted; they are only exempt from banning.
+	ignored := g.cfg.Ignored(ev.IP)
 
 	r := g.record(ip, now)
 	g.dirty = true
@@ -257,8 +258,8 @@ func (g *Guard) Handle(ev parser.Event) {
 	}
 	g.addEvent(Event{Time: now, IP: ip, User: ev.User, Type: "fail", Reason: ev.Reason})
 
-	if r.Banned(now) {
-		return // already blocked; a straggling log line from before the ban took effect
+	if ignored || r.Banned(now) {
+		return // whitelisted, or a straggling log line from before the ban took effect
 	}
 	cut := now.Add(-g.cfg.FindTime.D())
 	w := r.Window[:0]
@@ -364,11 +365,11 @@ func (g *Guard) ManualBan(ipStr string, d time.Duration) error {
 	if ip == nil {
 		return fmt.Errorf("invalid IP %q", ipStr)
 	}
-	if g.cfg.Ignored(ip) {
-		return fmt.Errorf("%s is in ignore_ip", ip)
-	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.cfg.Ignored(ip) {
+		return fmt.Errorf("%s 在白名单中", ip)
+	}
 	r := g.record(ip.String(), time.Now())
 	if d <= 0 {
 		d = g.banDuration(r.BanCount)
@@ -398,6 +399,90 @@ func (g *Guard) ManualUnban(ipStr string) error {
 	return nil
 }
 
+// ---- whitelist (ignore_ip), editable at runtime and written back to the config file
+
+// WhitelistAdd adds an IP or CIDR and lifts any active bans it covers.
+func (g *Guard) WhitelistAdd(entry string) (string, error) {
+	n, err := config.ParseCIDROrIP(entry)
+	if err != nil {
+		return "", fmt.Errorf("%q 不是有效的 IP 或网段", entry)
+	}
+	norm := config.FormatNet(n)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, e := range g.cfg.IgnoreIP {
+		if en, err := config.ParseCIDROrIP(e); err == nil && config.FormatNet(en) == norm {
+			return "", fmt.Errorf("%s 已在白名单中", norm)
+		}
+	}
+	old := g.cfg.IgnoreIP
+	g.cfg.IgnoreIP = append(append([]string(nil), old...), norm)
+	if err := g.commitConfig(old); err != nil {
+		return "", err
+	}
+	now := time.Now()
+	lifted := 0
+	for _, r := range g.st.Records {
+		if r.Banned(now) && n.Contains(net.ParseIP(r.IP)) {
+			_ = g.unban(r, "whitelisted")
+			r.Window = nil
+			lifted++
+		}
+	}
+	msg := "已加入白名单 " + norm
+	if lifted > 0 {
+		msg += fmt.Sprintf("，并解封 %d 个 IP", lifted)
+	}
+	log.Printf("WHITELIST add %s (lifted %d bans)", norm, lifted)
+	return msg, nil
+}
+
+func (g *Guard) WhitelistDel(entry string) (string, error) {
+	n, err := config.ParseCIDROrIP(entry)
+	if err != nil {
+		return "", fmt.Errorf("%q 不是有效的 IP 或网段", entry)
+	}
+	norm := config.FormatNet(n)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	old := g.cfg.IgnoreIP
+	var kept []string
+	for _, e := range old {
+		if en, err := config.ParseCIDROrIP(e); err == nil && config.FormatNet(en) == norm {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if len(kept) == len(old) {
+		return "", fmt.Errorf("%s 不在白名单中", norm)
+	}
+	g.cfg.IgnoreIP = kept
+	if err := g.commitConfig(old); err != nil {
+		return "", err
+	}
+	log.Printf("WHITELIST del %s", norm)
+	return "已从白名单移除 " + norm, nil
+}
+
+// commitConfig validates and persists g.cfg, restoring old ignore_ip on failure.
+// Must be called with g.mu held.
+func (g *Guard) commitConfig(old []string) error {
+	if err := g.cfg.Validate(); err != nil {
+		g.cfg.IgnoreIP = old
+		_ = g.cfg.Validate()
+		return err
+	}
+	if g.cfgPath == "" {
+		return nil
+	}
+	if err := g.cfg.Save(g.cfgPath); err != nil {
+		g.cfg.IgnoreIP = old
+		_ = g.cfg.Validate()
+		return fmt.Errorf("写入配置失败: %w", err)
+	}
+	return nil
+}
+
 // ---- snapshot for the API / TUI
 
 type Snapshot struct {
@@ -411,6 +496,7 @@ type Snapshot struct {
 	Stats     Stats       `json:"stats"`
 	Active    int         `json:"active_bans"`
 	UniqueIPs int         `json:"unique_ips"`
+	Whitelist []string    `json:"whitelist"`
 	Records   []*IPRecord `json:"records"`
 	Recent    []Event     `json:"recent"`
 }
@@ -425,6 +511,7 @@ func (g *Guard) Snapshot() *Snapshot {
 		Now: now, Started: g.started, Backend: g.fw.Name(), Source: g.source,
 		MaxRetry: g.cfg.MaxRetry, FindTime: g.cfg.FindTime.D().String(), BanTime: g.cfg.BanTime.D().String(),
 		UniqueIPs: len(g.st.Records),
+		Whitelist: append([]string(nil), g.cfg.IgnoreIP...),
 	}
 	b, _ := json.Marshal(g.st.Stats)
 	_ = json.Unmarshal(b, &s.Stats)
@@ -435,6 +522,7 @@ func (g *Guard) Snapshot() *Snapshot {
 		}
 		c := *r
 		c.Window = nil
+		c.Whitelisted = g.cfg.Ignored(net.ParseIP(r.IP))
 		c.Users = make(map[string]int64, len(r.Users))
 		for k, v := range r.Users {
 			c.Users[k] = v

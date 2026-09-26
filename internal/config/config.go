@@ -152,6 +152,14 @@ func ParseCIDROrIP(s string) (*net.IPNet, error) {
 	return &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}, nil
 }
 
+// FormatNet renders a single-host network as a bare IP, anything wider as CIDR.
+func FormatNet(n *net.IPNet) string {
+	if ones, bits := n.Mask.Size(); ones == bits {
+		return n.IP.String()
+	}
+	return n.String()
+}
+
 func (c *Config) Save(path string) error {
 	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {

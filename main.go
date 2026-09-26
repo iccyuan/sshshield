@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,6 +33,8 @@ const usage = `SSHShield - SSH 暴力破解防护
   sshshield status               打印统计与封禁列表
   sshshield ban <IP> [时长]      手动封禁，如 ban 1.2.3.4 24h
   sshshield unban <IP>           解除封禁
+  sshshield allow <IP|网段>      加入白名单（永不封禁，已封禁的会解封）
+  sshshield disallow <IP|网段>   移出白名单
   sshshield run                  以守护进程运行（systemd 调用）
   sshshield install              一键安装为 systemd 服务
   sshshield uninstall [--purge]  卸载（--purge 同时删除配置与数据）
@@ -70,7 +73,7 @@ func main() {
 		err = withSocket(*cfgPath, tui.Run)
 	case "status":
 		err = withSocket(*cfgPath, status)
-	case "ban", "unban":
+	case "ban", "unban", "allow", "disallow":
 		if len(rest) < 1 {
 			fs.Usage()
 			os.Exit(2)
@@ -80,10 +83,15 @@ func main() {
 			req.Duration = rest[1]
 		}
 		err = withSocket(*cfgPath, func(sock string) error {
-			if _, err := api.Call(sock, req); err != nil {
+			resp, err := api.Call(sock, req)
+			if err != nil {
 				return err
 			}
-			fmt.Printf("✓ %s %s\n", cmd, req.IP)
+			if resp.Message != "" {
+				fmt.Println("✓", resp.Message)
+			} else {
+				fmt.Printf("✓ %s %s\n", cmd, req.IP)
+			}
 			return nil
 		})
 	case "install":
@@ -140,7 +148,7 @@ func runDaemon(cfgPath string) error {
 	if file != "" {
 		srcDesc += ":" + file
 	}
-	g, err := guard.New(cfg, fw, srcDesc)
+	g, err := guard.New(cfg, cfgPath, fw, srcDesc)
 	if err != nil {
 		return err
 	}
@@ -208,6 +216,7 @@ func status(sock string) error {
 			top = append(top, r)
 		}
 	}
+	fmt.Printf("\n白名单: %s\n", strings.Join(s.Whitelist, ", "))
 	fmt.Printf("\n当前封禁 (%d):\n", len(banned))
 	for _, r := range banned {
 		fmt.Printf("  %-40s 失败 %-6d 第%d次封禁  剩余 %s\n", r.IP, r.Failures, r.BanCount, r.BannedUntil.Sub(s.Now).Round(time.Second))

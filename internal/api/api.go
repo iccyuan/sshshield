@@ -15,13 +15,14 @@ import (
 )
 
 type Request struct {
-	Cmd      string `json:"cmd"` // snapshot | ban | unban
+	Cmd      string `json:"cmd"` // snapshot | ban | unban | allow | disallow
 	IP       string `json:"ip,omitempty"`
 	Duration string `json:"duration,omitempty"`
 }
 
 type Response struct {
 	OK       bool            `json:"ok"`
+	Message  string          `json:"message,omitempty"`
 	Error    string          `json:"error,omitempty"`
 	Snapshot *guard.Snapshot `json:"snapshot,omitempty"`
 }
@@ -74,6 +75,10 @@ func handle(c net.Conn, g *guard.Guard) {
 		}
 	case "unban":
 		err = g.ManualUnban(req.IP)
+	case "allow":
+		resp.Message, err = g.WhitelistAdd(req.IP)
+	case "disallow":
+		resp.Message, err = g.WhitelistDel(req.IP)
 	default:
 		err = fmt.Errorf("unknown command %q", req.Cmd)
 	}

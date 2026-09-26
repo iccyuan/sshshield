@@ -31,10 +31,13 @@ sudo ./sshshield-linux-amd64 install
 | `sudo sshshield status` | 文字版统计 + 封禁列表 + Top 10 |
 | `sudo sshshield ban 1.2.3.4 24h` | 手动封禁（不写时长则按递增规则） |
 | `sudo sshshield unban 1.2.3.4` | 解封 |
+| `sudo sshshield allow 1.2.3.0/24` | 加入白名单（写回配置、立即生效，覆盖到的已封禁 IP 会解封） |
+| `sudo sshshield disallow 1.2.3.0/24` | 移出白名单 |
 | `journalctl -u sshshield -f` | 守护进程日志（每次封禁/解封都有记录） |
 
-TUI 键位：`↑↓/jk` 移动，`←→/Tab/1-4` 切换页，`u` 解封，`b` 封禁，`/` 过滤，`s` 排序（攻击来源页），`r` 刷新，`q` 退出。
-四个页签：封禁中 / 攻击来源 / 最近事件（最近 500 条）/ 用户名排行；顶部卡片显示总失败次数、今日失败、当前封禁、
+TUI 键位：`↑↓/jk` 移动，`←→/Tab/1-5` 切换页，`u` 解封，`b` 封禁，`w` 把选中 IP 加白，`/` 过滤，`s` 排序（攻击来源页），
+`r` 刷新，`q` 退出；白名单页里 `a` 添加、`d` 删除。
+五个页签：封禁中 / 攻击来源 / 最近事件（最近 500 条）/ 用户名排行 / 白名单；顶部卡片显示总失败次数、今日失败、当前封禁、
 累计封禁、今日封禁、攻击 IP 数、成功登录，以及近 14 天失败趋势。
 
 ## 配置 `/etc/sshshield/config.json`
@@ -46,7 +49,7 @@ TUI 键位：`↑↓/jk` 移动，`←→/Tab/1-4` 切换页，`u` 解封，`b` 
   "ban_time": "1h",          // 首次封禁时长
   "ban_time_factor": 2,      // 再犯倍数：1h → 2h → 4h ...
   "max_ban_time": "168h",    // 封顶
-  "ignore_ip": ["127.0.0.0/8", "::1"],   // 白名单，支持 CIDR
+  "ignore_ip": ["127.0.0.0/8", "::1"],   // 白名单，支持 CIDR；只免封禁，仍照常计数
   "ports": [],               // 为空 = 封禁该 IP 全部流量；如 [22] 只封 SSH 端口
   "source": "auto",          // auto | journal | file
   "log_file": "",            // source=file 时的日志路径，默认自动找 auth.log / secure

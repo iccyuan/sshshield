@@ -18,7 +18,7 @@ func newGuard(t *testing.T) *Guard {
 		t.Fatal(err)
 	}
 	fw, _ := firewall.New("none", nil)
-	g, err := New(cfg, fw, "test")
+	g, err := New(cfg, "", fw, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,21 +72,56 @@ func TestIgnoredAndPersist(t *testing.T) {
 	for range 5 {
 		g.Handle(ev("Invalid user x from 127.0.0.1 port 1"))
 	}
-	if len(g.st.Records) != 0 {
-		t.Fatal("loopback should be ignored")
+	lo := g.st.Records["127.0.0.1"]
+	if lo == nil || lo.Failures != 5 || lo.Banned(time.Now()) {
+		t.Fatalf("whitelisted IP must be counted but never banned: %+v", lo)
 	}
 	g.Handle(ev("Invalid user admin from 5.5.5.5 port 1"))
 	g.Handle(ev("Accepted publickey for bob from 6.6.6.6 port 1 ssh2: x"))
 	if err := g.Save(); err != nil {
 		t.Fatal(err)
 	}
-	g2, err := New(g.cfg, g.fw, "test")
+	g2, err := New(g.cfg, "", g.fw, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer g2.Close()
 	s := g2.Snapshot()
-	if s.Stats.TotalFailures != 1 || s.Stats.TotalSuccesses != 1 || s.UniqueIPs != 2 || s.Stats.Users["admin"] != 1 {
+	if s.Stats.TotalFailures != 6 || s.Stats.TotalSuccesses != 1 || s.UniqueIPs != 3 || s.Stats.Users["admin"] != 1 {
 		t.Fatalf("persisted stats wrong: %+v", s.Stats)
+	}
+}
+
+func TestWhitelistEdit(t *testing.T) {
+	g := newGuard(t)
+	g.cfgPath = t.TempDir() + "/config.json"
+	fail := ev("Failed password for root from 7.7.7.7 port 1 ssh2")
+	for range 3 {
+		g.Handle(fail)
+	}
+	if !g.st.Records["7.7.7.7"].Banned(time.Now()) {
+		t.Fatal("expected ban")
+	}
+	if _, err := g.WhitelistAdd("7.7.0.0/16"); err != nil {
+		t.Fatal(err)
+	}
+	if g.st.Records["7.7.7.7"].Banned(time.Now()) {
+		t.Fatal("whitelisting should lift the ban")
+	}
+	if _, err := g.WhitelistAdd("7.7.1.2/16"); err == nil {
+		t.Fatal("duplicate network accepted")
+	}
+	if err := g.ManualBan("7.7.7.7", 0); err == nil {
+		t.Fatal("banned a whitelisted IP")
+	}
+	c, err := config.Load(g.cfgPath)
+	if err != nil || !c.Ignored(parser.NormalizeIP("7.7.9.9")) {
+		t.Fatalf("whitelist not persisted: %v", err)
+	}
+	if _, err := g.WhitelistDel("7.7.0.0/16"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.WhitelistDel("7.7.0.0/16"); err == nil {
+		t.Fatal("deleting missing entry succeeded")
 	}
 }

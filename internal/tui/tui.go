@@ -3,6 +3,7 @@ package tui
 
 import (
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/iccyuan/sshshield/internal/api"
+	"github.com/iccyuan/sshshield/internal/config"
 	"github.com/iccyuan/sshshield/internal/guard"
 )
 
@@ -46,10 +48,11 @@ const (
 	tabAttackers
 	tabEvents
 	tabUsers
+	tabWhitelist
 	tabCount
 )
 
-var tabNames = [...]string{"封禁中", "攻击来源", "最近事件", "用户名排行"}
+var tabNames = [...]string{"封禁中", "攻击来源", "最近事件", "用户名排行", "白名单"}
 
 type col struct {
 	title string
@@ -58,10 +61,11 @@ type col struct {
 }
 
 type row struct {
-	cells  []string
-	ip     string
-	banned bool
-	style  lipgloss.Style
+	cells       []string
+	ip          string
+	banned      bool
+	whitelisted bool
+	style       lipgloss.Style
 }
 
 type (
@@ -85,6 +89,8 @@ type model struct {
 	sortBy  int // attackers: 0 failures, 1 last seen, 2 bans
 	filter  string
 	editing bool
+	adding  bool // typing a new whitelist entry
+	addBuf  string
 	confirm *pending
 	status  string
 	statusT time.Time
@@ -147,13 +153,27 @@ func (m *model) key(k tea.KeyMsg) tea.Cmd {
 		p := m.confirm
 		m.confirm = nil
 		if k.String() == "y" || k.String() == "Y" || k.String() == "enter" {
-			sock := m.sock
-			return func() tea.Msg {
-				_, err := api.Call(sock, p.req)
-				return actionMsg{text: p.req.Cmd + " " + p.req.IP + " 完成", err: err}
-			}
+			return m.call(p.req)
 		}
 		m.setStatus(sMuted.Render("已取消"))
+		return nil
+	}
+	if m.adding {
+		switch k.Type {
+		case tea.KeyEnter:
+			m.adding = false
+			if v := strings.TrimSpace(m.addBuf); v != "" {
+				return m.call(api.Request{Cmd: "allow", IP: v})
+			}
+		case tea.KeyEsc:
+			m.adding = false
+		case tea.KeyBackspace:
+			if r := []rune(m.addBuf); len(r) > 0 {
+				m.addBuf = string(r[:len(r)-1])
+			}
+		case tea.KeyRunes:
+			m.addBuf += string(k.Runes)
+		}
 		return nil
 	}
 	if m.editing {
@@ -180,7 +200,7 @@ func (m *model) key(k tea.KeyMsg) tea.Cmd {
 		m.tab = (m.tab + 1) % tabCount
 	case "shift+tab", "left", "h":
 		m.tab = (m.tab + tabCount - 1) % tabCount
-	case "1", "2", "3", "4":
+	case "1", "2", "3", "4", "5":
 		m.tab = tab(k.String()[0] - '1')
 	case "up", "k":
 		m.move(-1, len(rows))
@@ -205,11 +225,32 @@ func (m *model) key(k tea.KeyMsg) tea.Cmd {
 		}
 	case "r":
 		return m.fetch()
-	case "u", "b":
+	case "a":
+		if m.tab == tabWhitelist {
+			m.adding, m.addBuf = true, ""
+		}
+	case "d", "w", "u", "b":
 		if len(rows) == 0 || rows[m.cursor[m.tab]].ip == "" {
 			return nil
 		}
 		r := rows[m.cursor[m.tab]]
+		if m.tab == tabWhitelist {
+			if k.String() == "d" {
+				m.confirm = &pending{fmt.Sprintf("从白名单移除 %s ? (y/N)", r.ip), api.Request{Cmd: "disallow", IP: r.ip}}
+			}
+			return nil
+		}
+		if k.String() == "d" {
+			return nil
+		}
+		if k.String() == "w" {
+			if r.whitelisted {
+				m.setStatus(sMuted.Render(r.ip + " 已在白名单中"))
+				return nil
+			}
+			m.confirm = &pending{fmt.Sprintf("把 %s 加入白名单（永不封禁）? (y/N)", r.ip), api.Request{Cmd: "allow", IP: r.ip}}
+			return nil
+		}
 		if k.String() == "u" {
 			if !r.banned {
 				m.setStatus(sMuted.Render(r.ip + " 当前未被封禁"))
@@ -221,6 +262,18 @@ func (m *model) key(k tea.KeyMsg) tea.Cmd {
 		}
 	}
 	return nil
+}
+
+func (m *model) call(req api.Request) tea.Cmd {
+	sock := m.sock
+	return func() tea.Msg {
+		resp, err := api.Call(sock, req)
+		text := req.Cmd + " " + req.IP + " 完成"
+		if err == nil && resp.Message != "" {
+			text = resp.Message
+		}
+		return actionMsg{text: text, err: err}
+	}
 }
 
 func (m *model) move(d, n int) {
@@ -239,6 +292,8 @@ func (m *model) columns() []col {
 		return []col{{"IP", 40, false}, {"失败", 8, true}, {"成功", 6, true}, {"封禁#", 6, true}, {"状态", 10, false}, {"最后出现", 10, true}, {"常试用户", 0, false}}
 	case tabEvents:
 		return []col{{"时间", 19, false}, {"类型", 6, false}, {"IP", 40, false}, {"用户", 16, false}, {"原因", 0, false}}
+	case tabWhitelist:
+		return []col{{"IP / 网段", 44, false}, {"覆盖的已记录 IP", 16, true}, {"备注", 0, false}}
 	default:
 		return []col{{"#", 5, true}, {"用户名", 24, false}, {"尝试次数", 10, true}, {"占比", 8, true}, {"", 0, false}}
 	}
@@ -265,7 +320,7 @@ func (m *model) rows() []row {
 				r.BannedUntil.Local().Format("01-02 15:04:05"), r.LastUser, reason}})
 		}
 	case tabAttackers:
-		recs := filterRecs(s.Records, func(r *guard.IPRecord) bool { return r.Failures > 0 })
+		recs := filterRecs(s.Records, func(r *guard.IPRecord) bool { return r.Failures > 0 || r.Successes > 0 })
 		sort.Slice(recs, func(i, j int) bool {
 			a, b := recs[i], recs[j]
 			switch m.sortBy {
@@ -282,16 +337,22 @@ func (m *model) rows() []row {
 			st, style := "监视中", lipgloss.NewStyle()
 			if r.Banned(now) {
 				st, style = "已封禁", sRed
+			} else if r.Whitelisted {
+				st, style = "白名单", sGreen
 			}
-			out = append(out, row{ip: r.IP, banned: r.Banned(now), style: style, cells: []string{
+			out = append(out, row{ip: r.IP, banned: r.Banned(now), whitelisted: r.Whitelisted, style: style, cells: []string{
 				r.IP, num(r.Failures), num(r.Successes), fmt.Sprint(r.BanCount), st,
 				ago(now.Sub(r.LastSeen)), topUsers(r.Users, 4)}})
 		}
 	case tabEvents:
 		bannedSet := map[string]bool{}
+		whiteSet := map[string]bool{}
 		for _, r := range s.Records {
 			if r.Banned(now) {
 				bannedSet[r.IP] = true
+			}
+			if r.Whitelisted {
+				whiteSet[r.IP] = true
 			}
 		}
 		for i := len(s.Recent) - 1; i >= 0; i-- {
@@ -310,7 +371,7 @@ func (m *model) rows() []row {
 			default:
 				ty = e.Type
 			}
-			out = append(out, row{ip: e.IP, banned: bannedSet[e.IP], style: style, cells: []string{
+			out = append(out, row{ip: e.IP, banned: bannedSet[e.IP], whitelisted: whiteSet[e.IP], style: style, cells: []string{
 				e.Time.Local().Format("2006-01-02 15:04:05"), ty, e.IP, e.User, e.Reason}})
 		}
 	case tabUsers:
@@ -338,6 +399,23 @@ func (m *model) rows() []row {
 			pct := float64(e.v) * 100 / float64(max(total, 1))
 			bar := strings.Repeat("█", int(float64(e.v)*30/float64(top)))
 			out = append(out, row{cells: []string{fmt.Sprint(i + 1), e.k, num(e.v), fmt.Sprintf("%.1f%%", pct), sMuted.Render(bar)}})
+		}
+	case tabWhitelist:
+		for _, e := range s.Whitelist {
+			n, err := config.ParseCIDROrIP(e)
+			covered := 0
+			if err == nil {
+				for _, r := range s.Records {
+					if n.Contains(net.ParseIP(r.IP)) {
+						covered++
+					}
+				}
+			}
+			note := ""
+			if e == "127.0.0.0/8" || e == "::1" {
+				note = "本机回环（默认）"
+			}
+			out = append(out, row{ip: e, style: sGreen, cells: []string{e, num(int64(covered)), note}})
 		}
 	}
 	if m.filter != "" {
@@ -497,12 +575,17 @@ func (m *model) View() string {
 	switch {
 	case m.confirm != nil:
 		foot = sYellow.Bold(true).Render(m.confirm.prompt)
+	case m.adding:
+		foot = sYellow.Bold(true).Render("添加白名单 IP 或网段: ") + m.addBuf + "▏" + sMuted.Render("   Enter 确认  Esc 取消")
 	case m.editing:
 		foot = sMuted.Render("输入过滤文字  Enter 确认  Esc 清除")
 	default:
-		help := "↑↓ 移动  ←→/Tab/1-4 切换  u 解封  b 封禁  / 过滤"
-		if m.tab == tabAttackers {
+		help := "↑↓ 移动  ←→/Tab/1-5 切换  u 解封  b 封禁  w 加白  / 过滤"
+		switch m.tab {
+		case tabAttackers:
 			help += "  s 排序"
+		case tabWhitelist:
+			help = "↑↓ 移动  ←→/Tab/1-5 切换  a 添加  d 删除  / 过滤"
 		}
 		help += "  r 刷新  q 退出"
 		foot = sMuted.Render(help)
@@ -511,7 +594,23 @@ func (m *model) View() string {
 		}
 	}
 	b.WriteString(foot)
-	return b.String()
+	return fit(b.String(), m.w, m.h)
+}
+
+// fit clips every line to the terminal width and the frame to its height.
+// A line that wraps or a frame taller than the screen makes the terminal
+// scroll, and the renderer then repaints everything on each refresh (flicker).
+func fit(s string, w, h int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) > h {
+		lines = lines[:h]
+	}
+	for i, l := range lines {
+		if ansi.StringWidth(l) > w {
+			lines[i] = ansi.Truncate(l, w, "")
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func sAccent(s string) string { return lipgloss.NewStyle().Foreground(cAccent).Render(s) }
@@ -566,7 +665,8 @@ func (m *model) widths(cols []col) []int {
 		used += w[i] + 1
 	}
 	if flex >= 0 {
-		w[flex] = max(m.w-used-1, 8)
+		// fmtRow adds a leading space; keep the row strictly narrower than the terminal.
+		w[flex] = max(m.w-used-2, 8)
 	}
 	return w
 }
