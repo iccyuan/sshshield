@@ -13,6 +13,7 @@ import (
 type Backend interface {
 	Name() string
 	Setup() error
+	// Ban blocks ip for d; d <= 0 means until Unban (permanent).
 	Ban(ip net.IP, d time.Duration) error
 	Unban(ip net.IP) error
 	Teardown() error
@@ -96,14 +97,13 @@ func nftSet(ip net.IP) string {
 }
 
 func (n *nft) Ban(ip net.IP, d time.Duration) error {
-	secs := int(d.Seconds())
-	if secs < 1 {
-		secs = 1
-	}
 	// Re-adding an existing element fails, so drop any old one first.
 	_ = n.Unban(ip)
-	return run("nft", "", "add", "element", "inet", nftTable, nftSet(ip),
-		fmt.Sprintf("{ %s timeout %ds }", ip, secs))
+	elem := fmt.Sprintf("{ %s }", ip) // no timeout: stays until deleted
+	if d > 0 {
+		elem = fmt.Sprintf("{ %s timeout %ds }", ip, max(int(d.Seconds()), 1))
+	}
+	return run("nft", "", "add", "element", "inet", nftTable, nftSet(ip), elem)
 }
 
 func (n *nft) Unban(ip net.IP) error {

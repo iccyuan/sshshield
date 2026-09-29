@@ -28,6 +28,9 @@ const (
 	eventLogMaxSize = 20 << 20
 )
 
+// Permanent as a ban duration means the ban never expires.
+const Permanent time.Duration = -1
+
 type IPRecord struct {
 	IP          string           `json:"ip"`
 	Failures    int64            `json:"failures"`
@@ -38,6 +41,7 @@ type IPRecord struct {
 	BannedAt    time.Time        `json:"banned_at,omitzero"`
 	BannedUntil time.Time        `json:"banned_until,omitzero"`
 	Manual      bool             `json:"manual,omitempty"`
+	Permanent   bool             `json:"permanent,omitempty"`   // BannedUntil is zero while set
 	Whitelisted bool             `json:"whitelisted,omitempty"` // computed per snapshot from ignore_ip
 	LastUser    string           `json:"last_user,omitempty"`
 	LastReason  string           `json:"last_reason,omitempty"`
@@ -48,7 +52,7 @@ type IPRecord struct {
 	lastHardFail time.Time
 }
 
-func (r *IPRecord) Banned(now time.Time) bool { return now.Before(r.BannedUntil) }
+func (r *IPRecord) Banned(now time.Time) bool { return r.Permanent || now.Before(r.BannedUntil) }
 
 type Event struct {
 	Time   time.Time `json:"time"`
@@ -179,7 +183,11 @@ func (g *Guard) RestoreBans() {
 		if !r.Banned(now) {
 			continue
 		}
-		if err := g.fw.Ban(net.ParseIP(r.IP), r.BannedUntil.Sub(now)); err != nil {
+		d := Permanent
+		if !r.Permanent {
+			d = r.BannedUntil.Sub(now)
+		}
+		if err := g.fw.Ban(net.ParseIP(r.IP), d); err != nil {
 			log.Printf("restore ban %s: %v", r.IP, err)
 			continue
 		}
@@ -275,6 +283,9 @@ func (g *Guard) Handle(ev parser.Event) {
 }
 
 func (g *Guard) banDuration(prior int) time.Duration {
+	if g.cfg.PermAfter > 0 && prior >= g.cfg.PermAfter {
+		return Permanent
+	}
 	d := float64(g.cfg.BanTime.D()) * math.Pow(g.cfg.BanTimeFactor, float64(prior))
 	if d > float64(g.cfg.MaxBanTime.D()) || math.IsInf(d, 0) {
 		return g.cfg.MaxBanTime.D()
@@ -282,7 +293,14 @@ func (g *Guard) banDuration(prior int) time.Duration {
 	return time.Duration(d)
 }
 
-// ban must be called with g.mu held.
+func durText(d time.Duration) string {
+	if d < 0 {
+		return "永久"
+	}
+	return d.Round(time.Second).String()
+}
+
+// ban must be called with g.mu held; d < 0 bans permanently.
 func (g *Guard) ban(r *IPRecord, d time.Duration, manual bool, reason string) {
 	now := time.Now()
 	if err := g.fw.Ban(net.ParseIP(r.IP), d); err != nil {
@@ -291,19 +309,24 @@ func (g *Guard) ban(r *IPRecord, d time.Duration, manual bool, reason string) {
 	}
 	r.BanCount++
 	r.BannedAt = now
-	r.BannedUntil = now.Add(d)
+	r.Permanent = d < 0
+	r.BannedUntil = time.Time{}
+	if !r.Permanent {
+		r.BannedUntil = now.Add(d)
+	}
 	r.Manual = manual
 	r.Window = nil
 	g.st.Stats.TotalBans++
 	g.st.Stats.DailyBans[day(now)]++
 	g.dirty = true
-	log.Printf("BAN %s for %s (%s, ban #%d)", r.IP, d.Round(time.Second), reason, r.BanCount)
-	g.addEvent(Event{Time: now, IP: r.IP, Type: "ban", Reason: fmt.Sprintf("%s, %s", reason, d.Round(time.Second))})
+	log.Printf("BAN %s for %s (%s, ban #%d)", r.IP, durText(d), reason, r.BanCount)
+	g.addEvent(Event{Time: now, IP: r.IP, Type: "ban", Reason: fmt.Sprintf("%s, %s", reason, durText(d))})
 }
 
 func (g *Guard) unban(r *IPRecord, reason string) error {
 	err := g.fw.Unban(net.ParseIP(r.IP))
 	r.BannedUntil = time.Time{}
+	r.Permanent = false
 	r.Manual = false
 	g.dirty = true
 	log.Printf("UNBAN %s (%s)", r.IP, reason)
@@ -317,12 +340,12 @@ func (g *Guard) Tick() {
 	defer g.mu.Unlock()
 	now := time.Now()
 	for ip, r := range g.st.Records {
-		if !r.BannedUntil.IsZero() && !r.Banned(now) {
+		if !r.Permanent && !r.BannedUntil.IsZero() && !r.Banned(now) {
 			// nftables already dropped the element via its timeout; ignore that error.
 			_ = g.unban(r, "expired")
 		}
 		idle := now.Sub(r.LastSeen)
-		if r.BannedUntil.IsZero() && g.cfg.ForgetAfter > 0 && idle > g.cfg.ForgetAfter.D() {
+		if !r.Banned(now) && g.cfg.ForgetAfter > 0 && idle > g.cfg.ForgetAfter.D() {
 			delete(g.st.Records, ip)
 			g.dirty = true
 		}
@@ -359,7 +382,7 @@ func (g *Guard) addEvent(e Event) {
 	g.evLogSz += int64(n)
 }
 
-// ManualBan bans ip for d (0 = the escalating default).
+// ManualBan bans ip for d (0 = the escalating default, Permanent = forever).
 func (g *Guard) ManualBan(ipStr string, d time.Duration) error {
 	ip := parser.NormalizeIP(ipStr)
 	if ip == nil {
@@ -371,7 +394,7 @@ func (g *Guard) ManualBan(ipStr string, d time.Duration) error {
 		return fmt.Errorf("%s 在白名单中", ip)
 	}
 	r := g.record(ip.String(), time.Now())
-	if d <= 0 {
+	if d == 0 {
 		d = g.banDuration(r.BanCount)
 	}
 	g.ban(r, d, true, "manual")
@@ -495,6 +518,7 @@ type Snapshot struct {
 	BanTime   string      `json:"ban_time"`
 	Stats     Stats       `json:"stats"`
 	Active    int         `json:"active_bans"`
+	Perm      int         `json:"permanent_bans"`
 	UniqueIPs int         `json:"unique_ips"`
 	Whitelist []string    `json:"whitelist"`
 	Records   []*IPRecord `json:"records"`
@@ -519,6 +543,9 @@ func (g *Guard) Snapshot() *Snapshot {
 	for _, r := range g.st.Records {
 		if r.Banned(now) {
 			s.Active++
+		}
+		if r.Permanent {
+			s.Perm++
 		}
 		c := *r
 		c.Window = nil

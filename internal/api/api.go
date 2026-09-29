@@ -67,8 +67,15 @@ func handle(c net.Conn, g *guard.Guard) {
 		resp.Snapshot = g.Snapshot()
 	case "ban":
 		var d time.Duration
-		if req.Duration != "" {
+		switch req.Duration {
+		case "":
+		case "perm", "permanent", "forever", "永久":
+			d = guard.Permanent
+		default:
 			d, err = time.ParseDuration(req.Duration)
+			if err == nil && d <= 0 {
+				err = fmt.Errorf("时长必须大于 0，永久封禁请用 perm")
+			}
 		}
 		if err == nil {
 			err = g.ManualBan(req.IP, d)

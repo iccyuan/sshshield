@@ -57,6 +57,7 @@ type tab int
 
 const (
 	tabBanned tab = iota
+	tabPermanent
 	tabAttackers
 	tabEvents
 	tabUsers
@@ -64,7 +65,7 @@ const (
 	tabCount
 )
 
-var tabNames = [...]string{"封禁中", "攻击来源", "最近事件", "用户名排行", "白名单"}
+var tabNames = [...]string{"封禁中", "永久封禁", "攻击来源", "最近事件", "用户名排行", "白名单"}
 
 type col struct {
 	title string
@@ -289,7 +290,7 @@ func (m *model) onKey(k key) cmd {
 		m.tab = (m.tab + 1) % tabCount
 	case "shift+tab", "left", "h":
 		m.tab = (m.tab + tabCount - 1) % tabCount
-	case "1", "2", "3", "4", "5":
+	case "1", "2", "3", "4", "5", "6":
 		m.tab = tab(k.name[0] - '1')
 	case "up", "k":
 		m.move(-1, len(rows))
@@ -318,7 +319,7 @@ func (m *model) onKey(k key) cmd {
 		if m.tab == tabWhitelist {
 			m.adding, m.addBuf = true, ""
 		}
-	case "d", "w", "u", "b":
+	case "d", "w", "u", "b", "B":
 		if len(rows) == 0 || rows[m.cursor[m.tab]].ip == "" {
 			return nil
 		}
@@ -346,6 +347,8 @@ func (m *model) onKey(k key) cmd {
 				return nil
 			}
 			m.confirm = &pending{fmt.Sprintf("解封 %s ? (y/N)", r.ip), api.Request{Cmd: "unban", IP: r.ip}}
+		} else if k.name == "B" {
+			m.confirm = &pending{fmt.Sprintf("永久封禁 %s ? (y/N)", r.ip), api.Request{Cmd: "ban", IP: r.ip, Duration: "perm"}}
 		} else {
 			m.confirm = &pending{fmt.Sprintf("封禁 %s (按递增时长)? (y/N)", r.ip), api.Request{Cmd: "ban", IP: r.ip}}
 		}
@@ -388,6 +391,8 @@ func (m *model) columns() []col {
 	switch m.tab {
 	case tabBanned:
 		return []col{{"IP", 40, false}, {"失败", 8, true}, {"封禁#", 6, true}, {"剩余", 10, true}, {"解封时间", 16, false}, {"最后用户", 14, false}, {"最后原因", 0, false}}
+	case tabPermanent:
+		return []col{{"IP", 40, false}, {"失败", 8, true}, {"封禁#", 6, true}, {"封禁时间", 16, false}, {"最后出现", 10, true}, {"最后用户", 14, false}, {"原因", 0, false}}
 	case tabAttackers:
 		return []col{{"IP", 40, false}, {"失败", 8, true}, {"成功", 6, true}, {"封禁#", 6, true}, {"状态", 10, false}, {"最后出现", 10, true}, {"常试用户", 0, false}}
 	case tabEvents:
@@ -416,13 +421,25 @@ func (m *model) rows() []row {
 			return recs[i].IP < recs[j].IP
 		})
 		for _, r := range recs {
-			reason := r.LastReason
-			if r.Manual {
-				reason = "手动封禁"
+			left, until, style := countdown(r.BannedUntil.Sub(now)), r.BannedUntil.Local().Format("01-02 15:04:05"), lipgloss.NewStyle()
+			if r.Permanent {
+				left, until, style = "永久", "永不", sRed
 			}
-			out = append(out, row{ip: r.IP, banned: true, cells: []string{
-				r.IP, num(r.Failures), fmt.Sprint(r.BanCount), countdown(r.BannedUntil.Sub(now)),
-				r.BannedUntil.Local().Format("01-02 15:04:05"), r.LastUser, reason}})
+			out = append(out, row{ip: r.IP, banned: true, style: style, cells: []string{
+				r.IP, num(r.Failures), fmt.Sprint(r.BanCount), left, until, r.LastUser, banReason(r)}})
+		}
+	case tabPermanent:
+		recs := filterRecs(s.Records, func(r *guard.IPRecord) bool { return r.Permanent })
+		sort.Slice(recs, func(i, j int) bool {
+			if !recs[i].BannedAt.Equal(recs[j].BannedAt) {
+				return recs[i].BannedAt.After(recs[j].BannedAt)
+			}
+			return recs[i].IP < recs[j].IP
+		})
+		for _, r := range recs {
+			out = append(out, row{ip: r.IP, banned: true, style: sRed, cells: []string{
+				r.IP, num(r.Failures), fmt.Sprint(r.BanCount), r.BannedAt.Local().Format("01-02 15:04:05"),
+				ago(now.Sub(r.LastSeen)), r.LastUser, banReason(r)}})
 		}
 	case tabAttackers:
 		recs := filterRecs(s.Records, func(r *guard.IPRecord) bool { return r.Failures > 0 || r.Successes > 0 })
@@ -446,7 +463,9 @@ func (m *model) rows() []row {
 		})
 		for _, r := range recs {
 			st, style := "监视中", lipgloss.NewStyle()
-			if r.Banned(now) {
+			if r.Permanent {
+				st, style = "永久封禁", sRed
+			} else if r.Banned(now) {
 				st, style = "已封禁", sRed
 			} else if r.Whitelisted {
 				st, style = "白名单", sGreen
@@ -542,6 +561,13 @@ func (m *model) rows() []row {
 	return out
 }
 
+func banReason(r *guard.IPRecord) string {
+	if r.Manual {
+		return "手动封禁"
+	}
+	return r.LastReason
+}
+
 func filterRecs(in []*guard.IPRecord, keep func(*guard.IPRecord) bool) []*guard.IPRecord {
 	var out []*guard.IPRecord
 	for _, r := range in {
@@ -576,7 +602,7 @@ func topUsers(u map[string]int64, n int) string {
 
 // ---- view
 
-const numCards = 7
+const numCards = 8
 
 // cardRows is how many rows of stat cards fit the terminal width (cards need ~16 columns).
 func (m *model) cardRows() int {
@@ -619,6 +645,7 @@ func (m *model) render() string {
 		{"总失败次数", num(s.Stats.TotalFailures), sYellow},
 		{"今日失败", num(s.Stats.DailyFailures[today]), sYellow},
 		{"当前封禁", num(int64(s.Active)), sRed},
+		{"永久封禁", num(int64(s.Perm)), sRed},
 		{"累计封禁", num(s.Stats.TotalBans), sRed},
 		{"今日封禁", num(s.Stats.DailyBans[today]), sRed},
 		{"攻击 IP 数", num(int64(s.UniqueIPs)), sBold},
@@ -708,12 +735,12 @@ func (m *model) render() string {
 	case m.editing:
 		foot = sMuted.Render("输入过滤文字  Enter 确认  Esc 清除")
 	default:
-		help := "↑↓ 移动  ←→/Tab/1-5 切换  u 解封  b 封禁  w 加白  / 过滤"
+		help := "↑↓ 移动  ←→/Tab/1-6 切换  u 解封  b 封禁  B 永久封禁  w 加白  / 过滤"
 		switch m.tab {
 		case tabAttackers:
 			help += "  s 排序"
 		case tabWhitelist:
-			help = "↑↓ 移动  ←→/Tab/1-5 切换  a 添加  d 删除  / 过滤"
+			help = "↑↓ 移动  ←→/Tab/1-6 切换  a 添加  d 删除  / 过滤"
 		}
 		help += "  r 刷新  q 退出"
 		foot = sMuted.Render(help)

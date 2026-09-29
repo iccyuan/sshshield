@@ -49,6 +49,8 @@ type Config struct {
 	BanTime       Duration `json:"ban_time"`
 	BanTimeFactor float64  `json:"ban_time_factor"`
 	MaxBanTime    Duration `json:"max_ban_time"`
+	// After this many bans the next one is permanent; 0 disables.
+	PermAfter int `json:"perm_after"`
 	// IPs / CIDRs that are never banned.
 	IgnoreIP []string `json:"ignore_ip"`
 	// TCP ports to block for banned IPs; empty means drop all traffic from them.
@@ -73,6 +75,7 @@ func Default() *Config {
 		BanTime:       Duration(time.Hour),
 		BanTimeFactor: 2,
 		MaxBanTime:    Duration(7 * 24 * time.Hour),
+		PermAfter:     5,
 		IgnoreIP:      []string{"127.0.0.0/8", "::1"},
 		Ports:         []int{},
 		Source:        "auto",
@@ -107,6 +110,9 @@ func (c *Config) Validate() error {
 	}
 	if c.BanTimeFactor < 1 {
 		c.BanTimeFactor = 1
+	}
+	if c.PermAfter < 0 {
+		return errors.New("perm_after must be >= 0")
 	}
 	if c.MaxBanTime < c.BanTime {
 		c.MaxBanTime = c.BanTime

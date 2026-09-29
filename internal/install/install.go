@@ -123,7 +123,7 @@ func Install(cfgPath string) error {
 	fmt.Print("\n\033[32m✓ SSHShield 已安装并运行\033[0m\n")
 	fmt.Printf(`  查看面板:  sudo sshshield            (TUI)
   文字状态:  sudo sshshield status
-  手动封禁:  sudo sshshield ban <IP> [时长]
+  手动封禁:  sudo sshshield ban <IP> [时长|perm]
   解除封禁:  sudo sshshield unban <IP>
   配置文件:  %s  (改完执行 systemctl restart sshshield)
   服务日志:  journalctl -u sshshield -f

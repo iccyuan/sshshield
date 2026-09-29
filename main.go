@@ -31,7 +31,7 @@ const usage = `SSHShield - SSH 暴力破解防护
   sshshield                      打开 TUI 面板（同 tui）
   sshshield tui                  打开 TUI 面板
   sshshield status               打印统计与封禁列表
-  sshshield ban <IP> [时长]      手动封禁，如 ban 1.2.3.4 24h
+  sshshield ban <IP> [时长]      手动封禁，如 ban 1.2.3.4 24h；时长写 perm 为永久封禁
   sshshield unban <IP>           解除封禁
   sshshield allow <IP|网段>      加入白名单（永不封禁，已封禁的会解封）
   sshshield disallow <IP|网段>   移出白名单
@@ -204,8 +204,8 @@ func status(sock string) error {
 	today := s.Now.Format("2006-01-02")
 	fmt.Printf("SSHShield  后端=%s  来源=%s  规则=%d次/%s → 封%s起  已运行 %s\n\n",
 		s.Backend, s.Source, s.MaxRetry, s.FindTime, s.BanTime, s.Now.Sub(s.Started).Round(time.Second))
-	fmt.Printf("总失败次数 %d   今日失败 %d   当前封禁 %d   累计封禁 %d   攻击IP %d   成功登录 %d\n",
-		s.Stats.TotalFailures, s.Stats.DailyFailures[today], s.Active, s.Stats.TotalBans, s.UniqueIPs, s.Stats.TotalSuccesses)
+	fmt.Printf("总失败次数 %d   今日失败 %d   当前封禁 %d (永久 %d)   累计封禁 %d   攻击IP %d   成功登录 %d\n",
+		s.Stats.TotalFailures, s.Stats.DailyFailures[today], s.Active, s.Perm, s.Stats.TotalBans, s.UniqueIPs, s.Stats.TotalSuccesses)
 
 	var banned, top []*guard.IPRecord
 	for _, r := range s.Records {
@@ -219,7 +219,11 @@ func status(sock string) error {
 	fmt.Printf("\n白名单: %s\n", strings.Join(s.Whitelist, ", "))
 	fmt.Printf("\n当前封禁 (%d):\n", len(banned))
 	for _, r := range banned {
-		fmt.Printf("  %-40s 失败 %-6d 第%d次封禁  剩余 %s\n", r.IP, r.Failures, r.BanCount, r.BannedUntil.Sub(s.Now).Round(time.Second))
+		left := "永久"
+		if !r.Permanent {
+			left = r.BannedUntil.Sub(s.Now).Round(time.Second).String()
+		}
+		fmt.Printf("  %-40s 失败 %-6d 第%d次封禁  剩余 %s\n", r.IP, r.Failures, r.BanCount, left)
 	}
 	sort.Slice(top, func(i, j int) bool { return top[i].Failures > top[j].Failures })
 	if len(top) > 10 {

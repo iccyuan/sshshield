@@ -30,15 +30,16 @@ sudo ./sshshield-linux-amd64 install
 | `sudo sshshield` | TUI 面板 |
 | `sudo sshshield status` | 文字版统计 + 封禁列表 + Top 10 |
 | `sudo sshshield ban 1.2.3.4 24h` | 手动封禁（不写时长则按递增规则） |
+| `sudo sshshield ban 1.2.3.4 perm` | 永久封禁（不会过期，只能手动 `unban` 或加白解除） |
 | `sudo sshshield unban 1.2.3.4` | 解封 |
 | `sudo sshshield allow 1.2.3.0/24` | 加入白名单（写回配置、立即生效，覆盖到的已封禁 IP 会解封） |
 | `sudo sshshield disallow 1.2.3.0/24` | 移出白名单 |
 | `journalctl -u sshshield -f` | 守护进程日志（每次封禁/解封都有记录） |
 
-TUI 键位：`↑↓/jk` 移动，`←→/Tab/1-5` 切换页，`u` 解封，`b` 封禁，`w` 把选中 IP 加白，`/` 过滤，`s` 排序（攻击来源页），
+TUI 键位：`↑↓/jk` 移动，`←→/Tab/1-6` 切换页，`u` 解封，`b` 封禁，`B` 永久封禁，`w` 把选中 IP 加白，`/` 过滤，`s` 排序（攻击来源页），
 `r` 刷新，`q` 退出；白名单页里 `a` 添加、`d` 删除。
-五个页签：封禁中 / 攻击来源 / 最近事件（最近 500 条）/ 用户名排行 / 白名单；顶部卡片显示总失败次数、今日失败、当前封禁、
-累计封禁、今日封禁、攻击 IP 数、成功登录，以及近 14 天失败趋势。
+六个页签：封禁中（永久封禁的剩余时间显示为「永久」）/ 永久封禁 / 攻击来源 / 最近事件（最近 500 条）/ 用户名排行 / 白名单；
+顶部卡片显示总失败次数、今日失败、当前封禁、永久封禁、累计封禁、今日封禁、攻击 IP 数、成功登录，以及近 14 天失败趋势。
 
 ## 配置 `/etc/sshshield/config.json`
 
@@ -49,6 +50,7 @@ TUI 键位：`↑↓/jk` 移动，`←→/Tab/1-5` 切换页，`u` 解封，`b` 
   "ban_time": "1h",          // 首次封禁时长
   "ban_time_factor": 2,      // 再犯倍数：1h → 2h → 4h ...
   "max_ban_time": "168h",    // 封顶
+  "perm_after": 5,           // 封禁满 N 次后再犯即永久封禁（默认第 6 次）；0 = 关闭
   "ignore_ip": ["127.0.0.0/8", "::1"],   // 白名单，支持 CIDR；只免封禁，仍照常计数
   "ports": [],               // 为空 = 封禁该 IP 全部流量；如 [22] 只封 SSH 端口
   "source": "auto",          // auto | journal | file
@@ -73,7 +75,7 @@ TUI 键位：`↑↓/jk` 移动，`←→/Tab/1-5` 切换页，`u` 解封，`b` 
 - `/var/lib/sshshield/state.json`：每 IP 记录 + 全局统计，每 15 秒及退出时落盘，重启后自动恢复仍在有效期的封禁。
 - `/var/lib/sshshield/events.log`：所有失败/成功/封禁/解封事件（JSON Lines），超过 20MB 轮转为 `.1`。
 
-nftables 模式下封禁写在独立的 `inet sshshield` 表里并带超时，即使守护进程意外退出，封禁也会按时自动过期；
+nftables 模式下封禁写在独立的 `inet sshshield` 表里并带超时，即使守护进程意外退出，封禁也会按时自动过期（永久封禁不带超时）；
 服务停止时会删除该表。
 
 ## 构建

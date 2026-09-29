@@ -52,7 +52,7 @@ func TestBanAfterMaxRetry(t *testing.T) {
 	if d := r.BannedUntil.Sub(r.BannedAt); d != time.Hour {
 		t.Fatalf("first ban %s, want 1h", d)
 	}
-	if g.banDuration(1) != 2*time.Hour || g.banDuration(20) != 7*24*time.Hour {
+	if g.banDuration(1) != 2*time.Hour || g.banDuration(4) != 16*time.Hour || g.banDuration(5) != Permanent {
 		t.Fatal("escalation wrong")
 	}
 
@@ -123,5 +123,54 @@ func TestWhitelistEdit(t *testing.T) {
 	}
 	if _, err := g.WhitelistDel("7.7.0.0/16"); err == nil {
 		t.Fatal("deleting missing entry succeeded")
+	}
+}
+
+func TestPermanentBan(t *testing.T) {
+	g := newGuard(t)
+	g.cfg.PermAfter = 1
+	g.cfg.ForgetAfter = config.Duration(time.Nanosecond)
+	fail := ev("Failed password for root from 8.8.8.8 port 1 ssh2")
+	for range 3 {
+		g.Handle(fail)
+	}
+	r := g.st.Records["8.8.8.8"]
+	if r.Permanent || !r.Banned(time.Now()) {
+		t.Fatalf("first ban should be timed: %+v", r)
+	}
+	if err := g.ManualUnban("8.8.8.8"); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		g.Handle(fail)
+	}
+	if !r.Permanent || !r.BannedUntil.IsZero() {
+		t.Fatalf("second ban should be permanent (perm_after=1): %+v", r)
+	}
+	r.LastSeen = time.Now().Add(-time.Hour)
+	g.Tick()
+	if g.st.Records["8.8.8.8"] != r || !r.Banned(time.Now()) {
+		t.Fatal("tick expired or forgot a permanent ban")
+	}
+	if s := g.Snapshot(); s.Perm != 1 || s.Active != 1 {
+		t.Fatalf("snapshot perm=%d active=%d", s.Perm, s.Active)
+	}
+
+	if err := g.ManualBan("9.9.9.9", Permanent); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Save(); err != nil {
+		t.Fatal(err)
+	}
+	g2, err := New(g.cfg, "", g.fw, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g2.Close()
+	if r := g2.st.Records["9.9.9.9"]; r == nil || !r.Permanent || !r.Manual {
+		t.Fatalf("permanent ban not persisted: %+v", r)
+	}
+	if err := g2.ManualUnban("9.9.9.9"); err != nil || g2.st.Records["9.9.9.9"].Banned(time.Now()) {
+		t.Fatalf("unban permanent: %v", err)
 	}
 }
