@@ -2,8 +2,12 @@ package tui
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/iccyuan/sshshield/internal/guard"
 )
 
 func frameOut(t *testing.T, s *screen, frame string) string {
@@ -95,5 +99,32 @@ func TestScreenSkipsUnchangedMiddle(t *testing.T) {
 	}
 	if !strings.Contains(out, "3") || !strings.Contains(out, "8") {
 		t.Fatalf("changed digits missing: %q", out)
+	}
+}
+
+// Moving the selection must rewrite exactly the two affected rows, in an
+// explicit color (Termius re-flashes IPs in default-colored text) and without
+// wrapping the selected row onto a second line on narrow terminals.
+func TestSelectionRewritesTwoColoredRows(t *testing.T) {
+	now := time.Now()
+	s := &guard.Snapshot{Now: now, Started: now, Stats: guard.Stats{Users: map[string]int64{}, DailyFailures: map[string]int64{}}}
+	for i := range 4 {
+		ip := fmt.Sprintf("203.0.113.%d", 10+i)
+		s.Records = append(s.Records, &guard.IPRecord{IP: ip, Failures: int64(100 - i), LastSeen: now})
+		s.Recent = append(s.Recent, guard.Event{Time: now, IP: ip, User: "root", Type: "fail", Reason: "bad password"})
+	}
+	for _, tb := range []tab{tabAttackers, tabEvents} {
+		m := &model{snap: s, w: 80, h: 30, tab: tb}
+		scr := &screen{}
+		scr.resize(m.w, m.h)
+		frameOut(t, scr, m.render())
+		m.move(1, len(m.rows()))
+		out := frameOut(t, scr, m.render())
+		if n := strings.Count(out, "H\x1b[m"); n != 2 {
+			t.Errorf("tab %d: %d spans written, want 2: %q", tb, n, out)
+		}
+		if n := strings.Count(out, "H\x1b[m\x1b[38;"); n != 2 {
+			t.Errorf("tab %d: rows rewritten in the default color: %q", tb, out)
+		}
 	}
 }

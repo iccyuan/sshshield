@@ -24,7 +24,7 @@ import (
 const refreshEvery = time.Second
 
 var (
-	cAccent, cRed, cGreen, cYellow, cMuted, cBorder, cSelBg                     color.Color
+	cAccent, cText, cRed, cGreen, cYellow, cMuted, cBorder, cSelBg              color.Color
 	sTitle, sMuted, sRed, sGreen, sYellow, sBold, sCard, sTabOn, sTabOff, sHead lipgloss.Style
 )
 
@@ -34,6 +34,7 @@ func init() { setTheme(true) }
 func setTheme(dark bool) {
 	ld := lipgloss.LightDark(dark)
 	cAccent = ld(lipgloss.Color("#0969da"), lipgloss.Color("#58a6ff"))
+	cText = ld(lipgloss.Color("#1f2328"), lipgloss.Color("#e6edf3"))
 	cRed = ld(lipgloss.Color("#cf222e"), lipgloss.Color("#ff7b72"))
 	cGreen = ld(lipgloss.Color("#1a7f37"), lipgloss.Color("#3fb950"))
 	cYellow = ld(lipgloss.Color("#9a6700"), lipgloss.Color("#d29922"))
@@ -726,12 +727,19 @@ func (m *model) render() string {
 		b.WriteString(sMuted.Render("  （暂无数据）") + "\n")
 	}
 	for i := off; i < len(rows) && i < off+page; i++ {
-		line := fmtRow(rows[i].cells, cols, widths)
+		// Truncate first: Width() below wraps anything longer onto a second line.
+		line := ansi.Truncate(fmtRow(rows[i].cells, cols, widths), m.w-1, "")
+		st := rows[i].style
+		if _, ok := st.GetForeground().(lipgloss.NoColor); ok {
+			// Termius highlights IPs in default-colored text and re-flashes that
+			// highlight whenever the line is rewritten (e.g. selection moves).
+			st = st.Foreground(cText)
+		}
 		if i == cur {
 			// One style pass: nesting renders would reset the background mid-line.
-			line = rows[i].style.Background(cSelBg).Width(m.w - 1).Render(line)
+			line = st.Background(cSelBg).Width(m.w - 1).Render(line)
 		} else {
-			line = rows[i].style.Render(line)
+			line = st.Render(line)
 		}
 		b.WriteString(line + "\n")
 	}
