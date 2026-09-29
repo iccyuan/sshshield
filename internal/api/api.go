@@ -15,9 +15,11 @@ import (
 )
 
 type Request struct {
-	Cmd      string `json:"cmd"` // snapshot | ban | unban | allow | disallow
+	Cmd      string `json:"cmd"` // snapshot | ban | unban | allow | disallow | password
 	IP       string `json:"ip,omitempty"`
 	Duration string `json:"duration,omitempty"`
+	User     string `json:"user,omitempty"`
+	Password string `json:"password,omitempty"`
 }
 
 type Response struct {
@@ -82,6 +84,8 @@ func handle(c net.Conn, g *guard.Guard) {
 		}
 	case "unban":
 		err = g.ManualUnban(req.IP)
+	case "password":
+		err = g.PasswordAttempt(req.IP, req.User, req.Password)
 	case "allow":
 		resp.Message, err = g.WhitelistAdd(req.IP)
 	case "disallow":
@@ -97,7 +101,12 @@ func handle(c net.Conn, g *guard.Guard) {
 
 // Call sends one request to the daemon.
 func Call(path string, req Request) (*Response, error) {
-	c, err := net.DialTimeout("unix", path, 3*time.Second)
+	return CallTimeout(path, req, 10*time.Second)
+}
+
+// CallTimeout is Call with an overall deadline, for callers that must not hang.
+func CallTimeout(path string, req Request, timeout time.Duration) (*Response, error) {
+	c, err := net.DialTimeout("unix", path, min(3*time.Second, timeout))
 	if err != nil {
 		if errors.Is(err, os.ErrPermission) {
 			return nil, fmt.Errorf("permission denied on %s (run with sudo)", path)
@@ -105,7 +114,7 @@ func Call(path string, req Request) (*Response, error) {
 		return nil, fmt.Errorf("cannot reach sshshield daemon at %s (is the service running?): %w", path, err)
 	}
 	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	_ = c.SetDeadline(time.Now().Add(timeout))
 	if err := json.NewEncoder(c).Encode(&req); err != nil {
 		return nil, err
 	}

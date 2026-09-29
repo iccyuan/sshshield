@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -35,6 +36,7 @@ const usage = `SSHShield - SSH 暴力破解防护
   sshshield unban <IP>           解除封禁
   sshshield allow <IP|网段>      加入白名单（永不封禁，已封禁的会解封）
   sshshield disallow <IP|网段>   移出白名单
+  sshshield pam on|off|status    记录攻击者尝试的密码（在 /etc/pam.d/sshd 加 pam_exec 钩子）
   sshshield run                  以守护进程运行（systemd 调用）
   sshshield install              一键安装为 systemd 服务
   sshshield uninstall [--purge]  卸载（--purge 同时删除配置与数据）
@@ -67,6 +69,15 @@ func main() {
 
 	var err error
 	switch cmd {
+	case "pam-hook":
+		pamHook(*cfgPath) // called by pam_exec on every login attempt; must never fail loudly
+		return
+	case "pam":
+		if len(rest) < 1 {
+			fs.Usage()
+			os.Exit(2)
+		}
+		err = pamCmd(rest[0])
 	case "run":
 		err = runDaemon(*cfgPath)
 	case "tui":
@@ -111,6 +122,58 @@ func main() {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		os.Exit(1)
 	}
+}
+
+// sshd hands non-existent users this fake password instead of what was typed.
+const sshdFakePassword = "\b\n\r\177INCORRECT"
+
+// pamHook forwards one attempted password (stdin, from pam_exec expose_authtok)
+// to the daemon. It stays silent and quick so it can never slow down or break logins.
+func pamHook(cfgPath string) {
+	if os.Getenv("PAM_TYPE") != "auth" {
+		return
+	}
+	ip := os.Getenv("PAM_RHOST")
+	b, _ := io.ReadAll(io.LimitReader(os.Stdin, 1024))
+	pw, _, _ := strings.Cut(string(b), "\x00")
+	if ip == "" || pw == "" || pw == sshdFakePassword {
+		return
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return
+	}
+	_, _ = api.CallTimeout(cfg.Socket, api.Request{Cmd: "password", IP: ip, User: os.Getenv("PAM_USER"), Password: pw}, time.Second)
+}
+
+func pamCmd(action string) error {
+	switch action {
+	case "on":
+		if err := install.PAMEnable(); err != nil {
+			return err
+		}
+		fmt.Println("✓ 已开启密码记录（" + install.PAMFile + "），新的登录尝试立即生效")
+		fmt.Println("  只记录登录失败的密码；白名单 IP 不记录；登录成功的密码会被丢弃")
+		fmt.Println("  注意：只有允许密码登录的用户（sshd PasswordAuthentication）才能抓到密码")
+	case "off":
+		if err := install.PAMDisable(); err != nil {
+			return err
+		}
+		fmt.Println("✓ 已关闭密码记录（已记录的统计保留）")
+	case "status":
+		on, err := install.PAMEnabled()
+		if err != nil {
+			return err
+		}
+		if on {
+			fmt.Println("密码记录: 已开启")
+		} else {
+			fmt.Println("密码记录: 未开启（sudo sshshield pam on 开启）")
+		}
+	default:
+		return fmt.Errorf("用法: sshshield pam on|off|status")
+	}
+	return nil
 }
 
 func withSocket(cfgPath string, fn func(sock string) error) error {
@@ -232,6 +295,26 @@ func status(sock string) error {
 	fmt.Println("\n失败次数 Top 10:")
 	for _, r := range top {
 		fmt.Printf("  %-40s 失败 %-6d 封禁 %d 次  最后 %s\n", r.IP, r.Failures, r.BanCount, r.LastSeen.Local().Format("01-02 15:04"))
+	}
+	if len(s.Stats.Passwords) > 0 {
+		type kv struct {
+			k string
+			v int64
+		}
+		var pws []kv
+		for k, v := range s.Stats.Passwords {
+			pws = append(pws, kv{k, v})
+		}
+		sort.Slice(pws, func(i, j int) bool {
+			if pws[i].v != pws[j].v {
+				return pws[i].v > pws[j].v
+			}
+			return pws[i].k < pws[j].k
+		})
+		fmt.Printf("\n尝试密码 Top 10（共捕获 %d 次）:\n", s.Stats.TotalPasswords)
+		for _, e := range pws[:min(len(pws), 10)] {
+			fmt.Printf("  %-32s %d 次\n", e.k, e.v)
+		}
 	}
 	return nil
 }

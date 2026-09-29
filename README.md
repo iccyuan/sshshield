@@ -34,12 +34,13 @@ sudo ./sshshield-linux-amd64 install
 | `sudo sshshield unban 1.2.3.4` | 解封 |
 | `sudo sshshield allow 1.2.3.0/24` | 加入白名单（写回配置、立即生效，覆盖到的已封禁 IP 会解封） |
 | `sudo sshshield disallow 1.2.3.0/24` | 移出白名单 |
+| `sudo sshshield pam on` / `off` / `status` | 开关攻击者密码记录（见下文） |
 | `journalctl -u sshshield -f` | 守护进程日志（每次封禁/解封都有记录） |
 
-TUI 键位：`↑↓/jk` 移动，`←→/Tab/1-6` 切换页，`u` 解封，`b` 封禁，`B` 永久封禁，`w` 把选中 IP 加白，`/` 过滤，`s` 排序（攻击来源页），
+TUI 键位：`↑↓/jk` 移动，`←→/Tab/1-7` 切换页，`u` 解封，`b` 封禁，`B` 永久封禁，`w` 把选中 IP 加白，`/` 过滤，`s` 排序（攻击来源页），
 `r` 刷新，`q` 退出；白名单页里 `a` 添加、`d` 删除。
-六个页签：封禁中（永久封禁的剩余时间显示为「永久」）/ 永久封禁 / 攻击来源 / 最近事件（最近 500 条）/ 用户名排行 / 白名单；
-顶部卡片显示总失败次数、今日失败、当前封禁、永久封禁、累计封禁、今日封禁、攻击 IP 数、成功登录，以及近 14 天失败趋势。
+七个页签：封禁中（永久封禁的剩余时间显示为「永久」）/ 永久封禁 / 攻击来源 / 最近事件（最近 500 条，含捕获的密码）/ 用户名排行 / 密码排行 / 白名单；
+顶部卡片显示总失败次数、今日失败、当前封禁、永久封禁、累计封禁、今日封禁、攻击 IP 数、成功登录、捕获密码，以及近 14 天失败趋势。
 
 ## 配置 `/etc/sshshield/config.json`
 
@@ -69,6 +70,18 @@ TUI 键位：`↑↓/jk` 移动，`←→/Tab/1-6` 切换页，`u` 解封，`b` 
 计为一次失败：密码错误、不存在的用户、超过最大认证次数、`AllowUsers` 拒绝、未完成认证即断开（有效用户名），
 以及扫描器行为（无 SSH 标识串、错误 banner、算法协商失败）。同一次尝试产生的多行日志只计一次
 （如 `Invalid user` + `Failed password for invalid user`）。成功登录单独计数，不影响封禁。
+
+## 密码记录
+
+sshd 日志里没有攻击者输入的密码。`sudo sshshield pam on` 会在 `/etc/pam.d/sshd` 的 auth 段最前面加一行
+`auth optional pam_exec.so quiet expose_authtok /usr/local/bin/sshshield pam-hook`（原文件备份为 `sshd.sshshield.bak`），
+每次密码登录尝试都会把 IP、用户名、密码交给守护进程：
+
+- 只有 sshd 随后记录了 `Failed password` 才会计入统计；登录成功的那次密码直接丢弃，不落盘。
+- 白名单 IP 的密码一律不记录。但非白名单 IP 上管理员**输错**的密码会被记录，建议把自己的出口 IP 加白。
+- 只能抓到允许密码登录的用户（`PasswordAuthentication yes`，含 `Match User` 单独放开的）；不存在的用户 sshd 不会把真实密码交给 PAM。
+- 钩子是 `optional` + `quiet`，1 秒超时，守护进程没运行也不会影响登录。`sshshield pam off` 或卸载时自动移除。
+- 密码以明文存于 `state.json` / `events.log`（均为 0600，仅 root 可读）。
 
 ## 数据
 

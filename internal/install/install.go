@@ -125,6 +125,7 @@ func Install(cfgPath string) error {
   文字状态:  sudo sshshield status
   手动封禁:  sudo sshshield ban <IP> [时长|perm]
   解除封禁:  sudo sshshield unban <IP>
+  记录密码:  sudo sshshield pam on   (记录攻击者尝试的密码，pam off 关闭)
   配置文件:  %s  (改完执行 systemctl restart sshshield)
   服务日志:  journalctl -u sshshield -f
 `, cfgPath)
@@ -147,6 +148,7 @@ func Uninstall(cfgPath string, purge bool) error {
 			_ = fw.Teardown()
 		}
 	}
+	_ = PAMDisable()
 	_ = os.Remove(BinPath)
 	if purge {
 		_ = os.RemoveAll(filepath.Dir(cfgPath))

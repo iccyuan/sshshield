@@ -11,8 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/iccyuan/sshshield/internal/config"
 	"github.com/iccyuan/sshshield/internal/firewall"
@@ -26,6 +28,13 @@ const (
 	keepDays        = 60
 	softFailGrace   = 30 * time.Second
 	eventLogMaxSize = 20 << 20
+
+	maxPasswordsPerIP  = 30
+	maxGlobalPasswords = 2000
+	maxPasswordLen     = 64
+	maxPendingPerIP    = 10
+	// A captured password is kept only if sshd logs a failure for it within this window.
+	passwordMatchWindow = 30 * time.Second
 )
 
 // Permanent as a ban duration means the ban never expires.
@@ -46,6 +55,7 @@ type IPRecord struct {
 	LastUser    string           `json:"last_user,omitempty"`
 	LastReason  string           `json:"last_reason,omitempty"`
 	Users       map[string]int64 `json:"users,omitempty"`
+	Passwords   map[string]int64 `json:"passwords,omitempty"`
 	// Recent failure timestamps inside find_time, used for the ban decision.
 	Window []time.Time `json:"window,omitempty"`
 	// Last hard failure, used to avoid double counting the trailing preauth disconnect.
@@ -55,11 +65,12 @@ type IPRecord struct {
 func (r *IPRecord) Banned(now time.Time) bool { return r.Permanent || now.Before(r.BannedUntil) }
 
 type Event struct {
-	Time   time.Time `json:"time"`
-	IP     string    `json:"ip"`
-	User   string    `json:"user,omitempty"`
-	Type   string    `json:"type"` // fail | success | ban | unban
-	Reason string    `json:"reason,omitempty"`
+	Time     time.Time `json:"time"`
+	IP       string    `json:"ip"`
+	User     string    `json:"user,omitempty"`
+	Password string    `json:"password,omitempty"`
+	Type     string    `json:"type"` // fail | success | ban | unban
+	Reason   string    `json:"reason,omitempty"`
 }
 
 type Stats struct {
@@ -70,6 +81,8 @@ type Stats struct {
 	DailyFailures  map[string]int64 `json:"daily_failures"`
 	DailyBans      map[string]int64 `json:"daily_bans"`
 	Users          map[string]int64 `json:"users"`
+	TotalPasswords int64            `json:"total_passwords"` // failed attempts whose password was captured
+	Passwords      map[string]int64 `json:"passwords"`
 }
 
 type state struct {
@@ -90,10 +103,17 @@ type Guard struct {
 	dirty   bool
 	evLog   *os.File
 	evLogSz int64
+	// Passwords from the PAM hook waiting for sshd to log whether they failed.
+	pending map[string][]pendingPassword
+}
+
+type pendingPassword struct {
+	user, password string
+	at             time.Time
 }
 
 func New(cfg *config.Config, cfgPath string, fw firewall.Backend, source string) (*Guard, error) {
-	g := &Guard{cfg: cfg, cfgPath: cfgPath, fw: fw, source: source, started: time.Now()}
+	g := &Guard{cfg: cfg, cfgPath: cfgPath, fw: fw, source: source, started: time.Now(), pending: map[string][]pendingPassword{}}
 	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -147,6 +167,9 @@ func (g *Guard) fillMaps() {
 	}
 	if s.Users == nil {
 		s.Users = map[string]int64{}
+	}
+	if s.Passwords == nil {
+		s.Passwords = map[string]int64{}
 	}
 	if g.st.Records == nil {
 		g.st.Records = map[string]*IPRecord{}
@@ -236,6 +259,7 @@ func (g *Guard) Handle(ev parser.Event) {
 	r := g.record(ip, now)
 	g.dirty = true
 	if ev.Kind == parser.Success {
+		delete(g.pending, ip) // the password was right: never keep it
 		r.Successes++
 		g.st.Stats.TotalSuccesses++
 		g.addEvent(Event{Time: now, IP: ip, User: ev.User, Type: "success", Reason: ev.Reason})
@@ -248,6 +272,10 @@ func (g *Guard) Handle(ev parser.Event) {
 		r.lastHardFail = now
 	}
 
+	var password string
+	if ev.Kind == parser.Fail && ev.Reason == "bad password" {
+		password = g.takePending(ip, ev.User, now)
+	}
 	r.Failures++
 	r.LastReason = ev.Reason
 	g.st.Stats.TotalFailures++
@@ -264,7 +292,19 @@ func (g *Guard) Handle(ev parser.Event) {
 			g.st.Stats.Users[ev.User]++
 		}
 	}
-	g.addEvent(Event{Time: now, IP: ip, User: ev.User, Type: "fail", Reason: ev.Reason})
+	if password != "" {
+		g.st.Stats.TotalPasswords++
+		if r.Passwords == nil {
+			r.Passwords = map[string]int64{}
+		}
+		if _, ok := r.Passwords[password]; ok || len(r.Passwords) < maxPasswordsPerIP {
+			r.Passwords[password]++
+		}
+		if _, ok := g.st.Stats.Passwords[password]; ok || len(g.st.Stats.Passwords) < maxGlobalPasswords {
+			g.st.Stats.Passwords[password]++
+		}
+	}
+	g.addEvent(Event{Time: now, IP: ip, User: ev.User, Password: password, Type: "fail", Reason: ev.Reason})
 
 	if ignored || r.Banned(now) {
 		return // whitelisted, or a straggling log line from before the ban took effect
@@ -350,6 +390,11 @@ func (g *Guard) Tick() {
 			g.dirty = true
 		}
 	}
+	for ip, p := range g.pending {
+		if now.Sub(p[len(p)-1].at) > passwordMatchWindow {
+			delete(g.pending, ip)
+		}
+	}
 	cut := day(now.AddDate(0, 0, -keepDays))
 	for _, m := range []map[string]int64{g.st.Stats.DailyFailures, g.st.Stats.DailyBans} {
 		for d := range m {
@@ -380,6 +425,79 @@ func (g *Guard) addEvent(e Event) {
 	}
 	n, _ := g.evLog.Write(b)
 	g.evLogSz += int64(n)
+}
+
+// PasswordAttempt holds a password reported by the PAM hook until sshd logs
+// the outcome: it is recorded on "Failed password" and dropped on success.
+func (g *Guard) PasswordAttempt(ipStr, user, password string) error {
+	ip := parser.NormalizeIP(ipStr)
+	if ip == nil {
+		return fmt.Errorf("invalid IP %q", ipStr)
+	}
+	password = cleanPassword(password)
+	if password == "" {
+		return nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.cfg.Ignored(ip) {
+		return nil // never store what our own admins type
+	}
+	k := ip.String()
+	p := append(g.pending[k], pendingPassword{user: user, password: password, at: time.Now()})
+	if len(p) > maxPendingPerIP {
+		p = p[len(p)-maxPendingPerIP:]
+	}
+	g.pending[k] = p
+	return nil
+}
+
+// takePending pops the oldest fresh password for ip (preferring the same user).
+// Must be called with g.mu held.
+func (g *Guard) takePending(ip, user string, now time.Time) string {
+	p := g.pending[ip]
+	pick := -1
+	for i, e := range p {
+		if now.Sub(e.at) > passwordMatchWindow {
+			continue
+		}
+		if e.user == user {
+			pick = i
+			break
+		}
+		if pick < 0 {
+			pick = i
+		}
+	}
+	if pick < 0 {
+		return ""
+	}
+	pw := p[pick].password
+	g.pending[ip] = append(p[:pick:pick], p[pick+1:]...)
+	if len(g.pending[ip]) == 0 {
+		delete(g.pending, ip)
+	}
+	return pw
+}
+
+// cleanPassword escapes control characters so a password can never inject
+// terminal escape sequences into the TUI, and caps its length.
+func cleanPassword(s string) string {
+	var b strings.Builder
+	n := 0
+	for _, r := range s {
+		if n == maxPasswordLen {
+			b.WriteString("…")
+			break
+		}
+		if unicode.IsPrint(r) {
+			b.WriteRune(r)
+		} else {
+			fmt.Fprintf(&b, "\\x%02x", r)
+		}
+		n++
+	}
+	return b.String()
 }
 
 // ManualBan bans ip for d (0 = the escalating default, Permanent = forever).
@@ -553,6 +671,10 @@ func (g *Guard) Snapshot() *Snapshot {
 		c.Users = make(map[string]int64, len(r.Users))
 		for k, v := range r.Users {
 			c.Users[k] = v
+		}
+		c.Passwords = make(map[string]int64, len(r.Passwords))
+		for k, v := range r.Passwords {
+			c.Passwords[k] = v
 		}
 		s.Records = append(s.Records, &c)
 	}

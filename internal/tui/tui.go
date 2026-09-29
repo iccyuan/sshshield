@@ -61,11 +61,12 @@ const (
 	tabAttackers
 	tabEvents
 	tabUsers
+	tabPasswords
 	tabWhitelist
 	tabCount
 )
 
-var tabNames = [...]string{"封禁中", "永久封禁", "攻击来源", "最近事件", "用户名排行", "白名单"}
+var tabNames = [...]string{"封禁中", "永久封禁", "攻击来源", "最近事件", "用户名排行", "密码排行", "白名单"}
 
 type col struct {
 	title string
@@ -290,7 +291,7 @@ func (m *model) onKey(k key) cmd {
 		m.tab = (m.tab + 1) % tabCount
 	case "shift+tab", "left", "h":
 		m.tab = (m.tab + tabCount - 1) % tabCount
-	case "1", "2", "3", "4", "5", "6":
+	case "1", "2", "3", "4", "5", "6", "7":
 		m.tab = tab(k.name[0] - '1')
 	case "up", "k":
 		m.move(-1, len(rows))
@@ -396,7 +397,9 @@ func (m *model) columns() []col {
 	case tabAttackers:
 		return []col{{"IP", 40, false}, {"失败", 8, true}, {"成功", 6, true}, {"封禁#", 6, true}, {"状态", 10, false}, {"最后出现", 10, true}, {"常试用户", 0, false}}
 	case tabEvents:
-		return []col{{"时间", 19, false}, {"类型", 6, false}, {"IP", 40, false}, {"用户", 16, false}, {"原因", 0, false}}
+		return []col{{"时间", 19, false}, {"类型", 6, false}, {"IP", 40, false}, {"用户", 16, false}, {"密码", 18, false}, {"原因", 0, false}}
+	case tabPasswords:
+		return []col{{"#", 5, true}, {"密码", 32, false}, {"尝试次数", 10, true}, {"占比", 8, true}, {"", 0, false}}
 	case tabWhitelist:
 		return []col{{"IP / 网段", 44, false}, {"覆盖的已记录 IP", 16, true}, {"备注", 0, false}}
 	default:
@@ -502,34 +505,12 @@ func (m *model) rows() []row {
 				ty = e.Type
 			}
 			out = append(out, row{key: e.Time.Format(time.RFC3339Nano) + e.Type + e.IP, ip: e.IP, banned: bannedSet[e.IP], whitelisted: whiteSet[e.IP], style: style, cells: []string{
-				e.Time.Local().Format("2006-01-02 15:04:05"), ty, e.IP, e.User, e.Reason}})
+				e.Time.Local().Format("2006-01-02 15:04:05"), ty, e.IP, e.User, e.Password, e.Reason}})
 		}
 	case tabUsers:
-		type kv struct {
-			k string
-			v int64
-		}
-		var list []kv
-		var total int64
-		for k, v := range s.Stats.Users {
-			list = append(list, kv{k, v})
-			total += v
-		}
-		sort.Slice(list, func(i, j int) bool {
-			if list[i].v != list[j].v {
-				return list[i].v > list[j].v
-			}
-			return list[i].k < list[j].k
-		})
-		var top int64 = 1
-		if len(list) > 0 {
-			top = list[0].v
-		}
-		for i, e := range list {
-			pct := float64(e.v) * 100 / float64(max(total, 1))
-			bar := strings.Repeat("█", int(float64(e.v)*30/float64(top)))
-			out = append(out, row{key: e.k, cells: []string{fmt.Sprint(i + 1), e.k, num(e.v), fmt.Sprintf("%.1f%%", pct), sMuted.Render(bar)}})
-		}
+		out = rankRows(s.Stats.Users)
+	case tabPasswords:
+		out = rankRows(s.Stats.Passwords)
 	case tabWhitelist:
 		for _, e := range s.Whitelist {
 			n, err := config.ParseCIDROrIP(e)
@@ -557,6 +538,37 @@ func (m *model) rows() []row {
 			}
 		}
 		out = kept
+	}
+	return out
+}
+
+// rankRows turns a name → count map into ranked rows with a share bar.
+func rankRows(m map[string]int64) []row {
+	type kv struct {
+		k string
+		v int64
+	}
+	var list []kv
+	var total int64
+	for k, v := range m {
+		list = append(list, kv{k, v})
+		total += v
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].v != list[j].v {
+			return list[i].v > list[j].v
+		}
+		return list[i].k < list[j].k
+	})
+	var top int64 = 1
+	if len(list) > 0 {
+		top = list[0].v
+	}
+	var out []row
+	for i, e := range list {
+		pct := float64(e.v) * 100 / float64(max(total, 1))
+		bar := strings.Repeat("█", int(float64(e.v)*30/float64(top)))
+		out = append(out, row{key: e.k, cells: []string{fmt.Sprint(i + 1), e.k, num(e.v), fmt.Sprintf("%.1f%%", pct), sMuted.Render(bar)}})
 	}
 	return out
 }
@@ -602,7 +614,7 @@ func topUsers(u map[string]int64, n int) string {
 
 // ---- view
 
-const numCards = 8
+const numCards = 9
 
 // cardRows is how many rows of stat cards fit the terminal width (cards need ~16 columns).
 func (m *model) cardRows() int {
@@ -650,6 +662,7 @@ func (m *model) render() string {
 		{"今日封禁", num(s.Stats.DailyBans[today]), sRed},
 		{"攻击 IP 数", num(int64(s.UniqueIPs)), sBold},
 		{"成功登录", num(s.Stats.TotalSuccesses), sGreen},
+		{"捕获密码", num(s.Stats.TotalPasswords), sYellow},
 	}
 	perRow := (len(cards) + m.cardRows() - 1) / m.cardRows()
 	cw := max(m.w/perRow, 12) // lipgloss v2 widths include the border
@@ -735,12 +748,12 @@ func (m *model) render() string {
 	case m.editing:
 		foot = sMuted.Render("输入过滤文字  Enter 确认  Esc 清除")
 	default:
-		help := "↑↓ 移动  ←→/Tab/1-6 切换  u 解封  b 封禁  B 永久封禁  w 加白  / 过滤"
+		help := "↑↓ 移动  ←→/Tab/1-7 切换  u 解封  b 封禁  B 永久封禁  w 加白  / 过滤"
 		switch m.tab {
 		case tabAttackers:
 			help += "  s 排序"
 		case tabWhitelist:
-			help = "↑↓ 移动  ←→/Tab/1-6 切换  a 添加  d 删除  / 过滤"
+			help = "↑↓ 移动  ←→/Tab/1-7 切换  a 添加  d 删除  / 过滤"
 		}
 		help += "  r 刷新  q 退出"
 		foot = sMuted.Render(help)

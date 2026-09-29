@@ -174,3 +174,39 @@ func TestPermanentBan(t *testing.T) {
 		t.Fatalf("unban permanent: %v", err)
 	}
 }
+
+func TestPasswordCapture(t *testing.T) {
+	g := newGuard(t)
+	fail := ev("Failed password for root from 3.3.3.3 port 1 ssh2")
+
+	// Captured, then sshd logs the failure: recorded.
+	_ = g.PasswordAttempt("3.3.3.3", "root", "123456")
+	g.Handle(fail)
+	// Captured, then the login succeeds: must be dropped.
+	_ = g.PasswordAttempt("3.3.3.3", "root", "correct-horse")
+	g.Handle(ev("Accepted password for root from 3.3.3.3 port 1 ssh2"))
+	g.Handle(fail)
+	// Whitelisted IPs are never recorded.
+	_ = g.PasswordAttempt("127.0.0.1", "root", "admin-typo")
+	g.Handle(ev("Failed password for root from 127.0.0.1 port 1 ssh2"))
+	// Control characters are escaped.
+	_ = g.PasswordAttempt("3.3.3.3", "root", "a\x1b[2Jb")
+	g.Handle(fail)
+
+	s := g.Snapshot()
+	want := map[string]int64{"123456": 1, `a\x1b[2Jb`: 1}
+	if len(s.Stats.Passwords) != len(want) || s.Stats.TotalPasswords != 2 {
+		t.Fatalf("passwords %v total %d", s.Stats.Passwords, s.Stats.TotalPasswords)
+	}
+	for k, v := range want {
+		if s.Stats.Passwords[k] != v {
+			t.Fatalf("passwords %v, want %v", s.Stats.Passwords, want)
+		}
+	}
+	if r := g.st.Records["3.3.3.3"]; r.Passwords["123456"] != 1 || r.Passwords["correct-horse"] != 0 {
+		t.Fatalf("per-IP passwords %v", r.Passwords)
+	}
+	if len(g.pending) != 0 {
+		t.Fatalf("pending not drained: %v", g.pending)
+	}
+}
