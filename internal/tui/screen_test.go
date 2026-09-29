@@ -3,6 +3,7 @@ package tui
 import (
 	"bytes"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -102,29 +103,38 @@ func TestScreenSkipsUnchangedMiddle(t *testing.T) {
 	}
 }
 
-// Moving the selection must rewrite exactly the two affected rows, in an
-// explicit color (Termius re-flashes IPs in default-colored text) and without
-// wrapping the selected row onto a second line on narrow terminals.
-func TestSelectionRewritesTwoColoredRows(t *testing.T) {
+// Moving the selection must never rewrite an IP (Termius flashes its IP
+// highlight on each rewrite), must touch only the two affected rows, and must
+// not wrap the selected row onto a second line on narrow terminals.
+func TestSelectionLeavesIPsUntouched(t *testing.T) {
 	now := time.Now()
 	s := &guard.Snapshot{Now: now, Started: now, Stats: guard.Stats{Users: map[string]int64{}, DailyFailures: map[string]int64{}}}
 	for i := range 4 {
 		ip := fmt.Sprintf("203.0.113.%d", 10+i)
-		s.Records = append(s.Records, &guard.IPRecord{IP: ip, Failures: int64(100 - i), LastSeen: now})
+		s.Records = append(s.Records, &guard.IPRecord{IP: ip, Failures: int64(100 - i), LastSeen: now,
+			BannedUntil: now.Add(time.Hour), Users: map[string]int64{"root": 3}})
 		s.Recent = append(s.Recent, guard.Event{Time: now, IP: ip, User: "root", Type: "fail", Reason: "bad password"})
 	}
-	for _, tb := range []tab{tabAttackers, tabEvents} {
-		m := &model{snap: s, w: 80, h: 30, tab: tb}
-		scr := &screen{}
-		scr.resize(m.w, m.h)
-		frameOut(t, scr, m.render())
-		m.move(1, len(m.rows()))
-		out := frameOut(t, scr, m.render())
-		if n := strings.Count(out, "H\x1b[m"); n != 2 {
-			t.Errorf("tab %d: %d spans written, want 2: %q", tb, n, out)
-		}
-		if n := strings.Count(out, "H\x1b[m\x1b[38;"); n != 2 {
-			t.Errorf("tab %d: rows rewritten in the default color: %q", tb, out)
+	s.Records[0].Permanent = true
+	rowRe := regexp.MustCompile(`\[(\d+);\d+H`)
+	for _, tb := range []tab{tabBanned, tabAttackers, tabEvents} {
+		for _, w := range []int{80, 160} {
+			m := &model{snap: s, w: w, h: 30, tab: tb}
+			scr := &screen{}
+			scr.resize(m.w, m.h)
+			frameOut(t, scr, m.render())
+			m.move(1, len(m.rows()))
+			out := frameOut(t, scr, m.render())
+			if strings.Contains(out, "203.0.113") {
+				t.Errorf("tab %d w=%d: IP rewritten: %q", tb, w, out)
+			}
+			ys := map[string]bool{}
+			for _, mm := range rowRe.FindAllStringSubmatch(out, -1) {
+				ys[mm[1]] = true
+			}
+			if len(ys) != 2 {
+				t.Errorf("tab %d w=%d: rows %v rewritten, want 2: %q", tb, w, ys, out)
+			}
 		}
 	}
 }

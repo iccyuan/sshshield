@@ -24,7 +24,7 @@ import (
 const refreshEvery = time.Second
 
 var (
-	cAccent, cText, cRed, cGreen, cYellow, cMuted, cBorder, cSelBg              color.Color
+	cAccent, cRed, cGreen, cYellow, cMuted, cBorder, cSelBg                     color.Color
 	sTitle, sMuted, sRed, sGreen, sYellow, sBold, sCard, sTabOn, sTabOff, sHead lipgloss.Style
 )
 
@@ -34,7 +34,6 @@ func init() { setTheme(true) }
 func setTheme(dark bool) {
 	ld := lipgloss.LightDark(dark)
 	cAccent = ld(lipgloss.Color("#0969da"), lipgloss.Color("#58a6ff"))
-	cText = ld(lipgloss.Color("#1f2328"), lipgloss.Color("#e6edf3"))
 	cRed = ld(lipgloss.Color("#cf222e"), lipgloss.Color("#ff7b72"))
 	cGreen = ld(lipgloss.Color("#1a7f37"), lipgloss.Color("#3fb950"))
 	cYellow = ld(lipgloss.Color("#9a6700"), lipgloss.Color("#d29922"))
@@ -727,19 +726,11 @@ func (m *model) render() string {
 		b.WriteString(sMuted.Render("  （暂无数据）") + "\n")
 	}
 	for i := off; i < len(rows) && i < off+page; i++ {
-		// Truncate first: Width() below wraps anything longer onto a second line.
 		line := ansi.Truncate(fmtRow(rows[i].cells, cols, widths), m.w-1, "")
-		st := rows[i].style
-		if _, ok := st.GetForeground().(lipgloss.NoColor); ok {
-			// Termius highlights IPs in default-colored text and re-flashes that
-			// highlight whenever the line is rewritten (e.g. selection moves).
-			st = st.Foreground(cText)
-		}
 		if i == cur {
-			// One style pass: nesting renders would reset the background mid-line.
-			line = st.Background(cSelBg).Width(m.w - 1).Render(line)
+			line = selectedRow(line, rows[i].cells, cols, widths, rows[i].style, m.w-1)
 		} else {
-			line = st.Render(line)
+			line = rows[i].style.Render(line)
 		}
 		b.WriteString(line + "\n")
 	}
@@ -853,6 +844,30 @@ func headers(cols []col) []string {
 		h[i] = c.title
 	}
 	return h
+}
+
+// selectedRow paints the selection bar over line (plain fmtRow output) but
+// leaves the IP text exactly as an unselected row draws it. The renderer then
+// never rewrites those cells when the selection moves: Termius flashes its IP
+// highlight on every rewrite of an IP, so the IP must stay untouched.
+func selectedRow(line string, cells []string, cols []col, widths []int, st lipgloss.Style, w int) string {
+	bar := st.Background(cSelBg)
+	mark := bar.Foreground(cAccent).Render("▌")
+	pad := func(s string, used int) string { return s + strings.Repeat(" ", max(w-used, 0)) }
+	start := 1 // fmtRow's leading space
+	for k, c := range cols {
+		if strings.HasPrefix(c.title, "IP") && k < len(cells) {
+			ip := ansi.Truncate(cells[k], widths[k], "…")
+			end := start + ansi.StringWidth(ip)
+			if ip == "" || end > ansi.StringWidth(line) {
+				break
+			}
+			tail := pad(ansi.Cut(line, end, w), ansi.StringWidth(line))
+			return mark + bar.Render(ansi.Cut(line, 1, start)) + st.Render(ip) + bar.Render(tail)
+		}
+		start += widths[k] + 1
+	}
+	return mark + bar.Render(pad(ansi.Cut(line, 1, w), ansi.StringWidth(line)))
 }
 
 func fmtRow(cells []string, cols []col, widths []int) string {
