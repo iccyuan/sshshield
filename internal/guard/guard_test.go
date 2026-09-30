@@ -210,3 +210,18 @@ func TestPasswordCapture(t *testing.T) {
 		t.Fatalf("pending not drained: %v", g.pending)
 	}
 }
+
+func TestIsSSHDFakePassword(t *testing.T) {
+	for pw, want := range map[string]bool{
+		"\b\n\r\x7fIN":                    true, // 6-char password
+		"\b\n\r\x7fINCORRECT":             true,
+		"\b\n\r\x7fINCORRECT\b\n\r\x7fIN": true, // longer than the junk
+		"123456":                          false,
+		"":                                false,
+		"\b\n\r\x7fINCORRECTx":            false,
+	} {
+		if got := IsSSHDFakePassword(pw); got != want {
+			t.Errorf("IsSSHDFakePassword(%q) = %v, want %v", pw, got, want)
+		}
+	}
+}

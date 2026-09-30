@@ -124,9 +124,6 @@ func main() {
 	}
 }
 
-// sshd hands non-existent users this fake password instead of what was typed.
-const sshdFakePassword = "\b\n\r\177INCORRECT"
-
 // pamHook forwards one attempted password (stdin, from pam_exec expose_authtok)
 // to the daemon. It stays silent and quick so it can never slow down or break logins.
 func pamHook(cfgPath string) {
@@ -136,7 +133,7 @@ func pamHook(cfgPath string) {
 	ip := os.Getenv("PAM_RHOST")
 	b, _ := io.ReadAll(io.LimitReader(os.Stdin, 1024))
 	pw, _, _ := strings.Cut(string(b), "\x00")
-	if ip == "" || pw == "" || pw == sshdFakePassword {
+	if ip == "" || pw == "" || guard.IsSSHDFakePassword(pw) {
 		return
 	}
 	cfg, err := config.Load(cfgPath)
@@ -155,6 +152,7 @@ func pamCmd(action string) error {
 		fmt.Println("✓ 已开启密码记录（" + install.PAMFile + "），新的登录尝试立即生效")
 		fmt.Println("  只记录登录失败的密码；白名单 IP 不记录；登录成功的密码会被丢弃")
 		fmt.Println("  注意：只有允许密码登录的用户（sshd PasswordAuthentication）才能抓到密码")
+		fmt.Println("  不存在的用户、以及 PermitRootLogin 不是 yes 时的 root，sshd 不会把真实密码交给 PAM，无法记录")
 	case "off":
 		if err := install.PAMDisable(); err != nil {
 			return err

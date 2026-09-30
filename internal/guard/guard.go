@@ -434,6 +434,9 @@ func (g *Guard) PasswordAttempt(ipStr, user, password string) error {
 	if ip == nil {
 		return fmt.Errorf("invalid IP %q", ipStr)
 	}
+	if IsSSHDFakePassword(password) {
+		return nil
+	}
 	password = cleanPassword(password)
 	if password == "" {
 		return nil
@@ -478,6 +481,25 @@ func (g *Guard) takePending(ip, user string, now time.Time) string {
 		delete(g.pending, ip)
 	}
 	return pw
+}
+
+// sshdFakeJunk is what sshd repeats in place of the typed password.
+const sshdFakeJunk = "\b\n\r\177INCORRECT"
+
+// IsSSHDFakePassword reports whether pw is sshd's stand-in for a password it
+// refuses to give PAM (invalid users, and root when PermitRootLogin is not
+// "yes"): the junk string cycled to the typed password's length, so only the
+// length of the real password survives.
+func IsSSHDFakePassword(pw string) bool {
+	if pw == "" {
+		return false
+	}
+	for i := 0; i < len(pw); i++ {
+		if pw[i] != sshdFakeJunk[i%len(sshdFakeJunk)] {
+			return false
+		}
+	}
+	return true
 }
 
 // cleanPassword escapes control characters so a password can never inject
