@@ -657,7 +657,7 @@ type Snapshot struct {
 	FindTime  string      `json:"find_time"`
 	BanTime   string      `json:"ban_time"`
 	Stats     Stats       `json:"stats"`
-	Active    int         `json:"active_bans"`
+	Active    int         `json:"active_bans"` // temporary bans only; permanent ones are counted in Perm
 	Perm      int         `json:"permanent_bans"`
 	UniqueIPs int         `json:"unique_ips"`
 	Whitelist []string    `json:"whitelist"`
@@ -681,11 +681,10 @@ func (g *Guard) Snapshot() *Snapshot {
 	_ = json.Unmarshal(b, &s.Stats)
 	s.Records = make([]*IPRecord, 0, len(g.st.Records))
 	for _, r := range g.st.Records {
-		if r.Banned(now) {
-			s.Active++
-		}
 		if r.Permanent {
 			s.Perm++
+		} else if r.Banned(now) {
+			s.Active++
 		}
 		c := *r
 		c.Window = nil

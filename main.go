@@ -265,7 +265,7 @@ func status(sock string) error {
 	today := s.Now.Format("2006-01-02")
 	fmt.Printf("SSHShield  后端=%s  来源=%s  规则=%d次/%s → 封%s起  已运行 %s\n\n",
 		s.Backend, s.Source, s.MaxRetry, s.FindTime, s.BanTime, s.Now.Sub(s.Started).Round(time.Second))
-	fmt.Printf("总失败次数 %d   今日失败 %d   当前封禁 %d (永久 %d)   累计封禁 %d   攻击IP %d   成功登录 %d\n",
+	fmt.Printf("总失败次数 %d   今日失败 %d   临时封禁 %d   永久封禁 %d   累计封禁 %d   攻击IP %d   成功登录 %d\n",
 		s.Stats.TotalFailures, s.Stats.DailyFailures[today], s.Active, s.Perm, s.Stats.TotalBans, s.UniqueIPs, s.Stats.TotalSuccesses)
 
 	var banned, top []*guard.IPRecord
@@ -278,7 +278,7 @@ func status(sock string) error {
 		}
 	}
 	fmt.Printf("\n白名单: %s\n", strings.Join(s.Whitelist, ", "))
-	fmt.Printf("\n当前封禁 (%d):\n", len(banned))
+	fmt.Printf("\n当前封禁 (%d，含永久):\n", len(banned))
 	for _, r := range banned {
 		left := "永久"
 		if !r.Permanent {

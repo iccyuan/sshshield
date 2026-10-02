@@ -152,7 +152,7 @@ func TestPermanentBan(t *testing.T) {
 	if g.st.Records["8.8.8.8"] != r || !r.Banned(time.Now()) {
 		t.Fatal("tick expired or forgot a permanent ban")
 	}
-	if s := g.Snapshot(); s.Perm != 1 || s.Active != 1 {
+	if s := g.Snapshot(); s.Perm != 1 || s.Active != 0 {
 		t.Fatalf("snapshot perm=%d active=%d", s.Perm, s.Active)
 	}
 

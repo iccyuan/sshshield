@@ -416,7 +416,8 @@ func (m *model) rows() []row {
 	var out []row
 	switch m.tab {
 	case tabBanned:
-		recs := filterRecs(s.Records, func(r *guard.IPRecord) bool { return r.Banned(now) })
+		// Permanent bans live in their own tab.
+		recs := filterRecs(s.Records, func(r *guard.IPRecord) bool { return !r.Permanent && r.Banned(now) })
 		sort.Slice(recs, func(i, j int) bool {
 			if !recs[i].BannedAt.Equal(recs[j].BannedAt) {
 				return recs[i].BannedAt.After(recs[j].BannedAt)
@@ -424,11 +425,8 @@ func (m *model) rows() []row {
 			return recs[i].IP < recs[j].IP
 		})
 		for _, r := range recs {
-			left, until, style := countdown(r.BannedUntil.Sub(now)), r.BannedUntil.Local().Format("01-02 15:04:05"), lipgloss.NewStyle()
-			if r.Permanent {
-				left, until, style = "永久", "永不", sRed
-			}
-			out = append(out, row{ip: r.IP, banned: true, style: style, cells: []string{
+			left, until := countdown(r.BannedUntil.Sub(now)), r.BannedUntil.Local().Format("01-02 15:04:05")
+			out = append(out, row{ip: r.IP, banned: true, style: lipgloss.NewStyle(), cells: []string{
 				r.IP, num(r.Failures), fmt.Sprint(r.BanCount), left, until, r.LastUser, banReason(r)}})
 		}
 	case tabPermanent:
@@ -656,7 +654,7 @@ func (m *model) render() string {
 	}{
 		{"总失败次数", num(s.Stats.TotalFailures), sYellow},
 		{"今日失败", num(s.Stats.DailyFailures[today]), sYellow},
-		{"当前封禁", num(int64(s.Active)), sRed},
+		{"临时封禁", num(int64(s.Active)), sRed},
 		{"永久封禁", num(int64(s.Perm)), sRed},
 		{"累计封禁", num(s.Stats.TotalBans), sRed},
 		{"今日封禁", num(s.Stats.DailyBans[today]), sRed},
